@@ -46,6 +46,10 @@ export const resultFor = (
       return cacheEntriesResult(port);
     case "CacheStorage.requestCachedResponse":
       return cachedResponseResult(options);
+    case "Performance.getMetrics":
+      return { metrics: [{ name: "Timestamp", value: 0 }] };
+    case "Performance.enable":
+    case "Performance.disable":
     case "Page.enable":
     case "Page.disable":
     case "Page.setLifecycleEventsEnabled":

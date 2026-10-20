@@ -37,6 +37,12 @@ available in the capture.
 - Every surface has equivalent CLI and MCP contracts and returns Evidence provenance.
 - MCP tools return complete results inline and include the Evidence ID. Session evidence can be exported with `export_evidence_bundle`.
 
+Session observation samples the target's monotonic clock before enabling lifecycle
+collection. Replayed lifecycle milestones older than that sample are excluded;
+new milestones from the initial loader remain eligible. This attach-time cutoff
+precedes the armed notification. Missing or invalid lifecycle timestamps make
+timeline coverage incomplete; an unavailable or invalid clock prevents arming.
+
 Target discovery returns the complete in-scope target array in one result.
 
 ## Screenshot comparison memory budget

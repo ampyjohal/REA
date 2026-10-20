@@ -79,6 +79,7 @@ export const observeCdpSession = async (
       context.sessionId,
       context.signal,
     );
+    capture.startLifecycle(await readLifecycleStart(context));
     await context.connection.send(
       "Page.setLifecycleEventsEnabled",
       { enabled: true },
@@ -124,7 +125,7 @@ export const observeCdpSession = async (
       timeline: capture.timeline,
       completeness: capture.completeness.snapshot(),
       limitations: [
-        "The timeline begins after REA attaches; earlier navigation and network activity is unavailable.",
+        "The timeline begins after REA attaches; earlier navigation and network activity is unavailable. Lifecycle milestones older than the attach-time browser clock sample are excluded.",
         "Only navigation metadata is retained; headers, bodies, cookies, console values, and payloads are not captured by this tool.",
         "An out-of-policy destination ends collection immediately and is recorded without its URL.",
       ],
@@ -135,11 +136,44 @@ export const observeCdpSession = async (
   }
 };
 
+/** Use the target's monotonic clock, never the host's wall clock or loader identity. */
+const readLifecycleStart = async (
+  context: ObservationContext,
+): Promise<number> => {
+  const { connection, sessionId, signal } = context;
+  await connection.send("Performance.enable", {}, sessionId, signal);
+  const result = await connection.send(
+    "Performance.getMetrics",
+    {},
+    sessionId,
+    signal,
+  );
+  // The target-session owner closes the transport if any command fails or is cancelled.
+  await connection.send("Performance.disable", {}, sessionId, signal);
+  const metrics = recordValue(result)?.metrics;
+  const clocks = Array.isArray(metrics)
+    ? metrics.filter(
+        (metric: unknown) => recordValue(metric)?.name === "Timestamp",
+      )
+    : [];
+  const timestamp =
+    clocks.length === 1
+      ? numberValue(recordValue(clocks[0])?.value)
+      : undefined;
+  if (timestamp === undefined || timestamp < 0)
+    throw new BrowserObservationError("observe_web_session", "protocol_error", {
+      detail:
+        "The browser did not provide a valid monotonic observation timestamp.",
+    });
+  return timestamp;
+};
+
 class TimelineCapture {
   readonly timeline: TimelineEvent[] = [];
   readonly completeness = new CdpCaptureCompleteness(["timeline"]);
   finalUrl: string | null;
   #sequence = 0;
+  #lifecycleStart: number | undefined;
   #pendingReload = false;
   #scopeExcluded = false;
   #endReason: EndReason | undefined;
@@ -152,6 +186,10 @@ class TimelineCapture {
   ) {
     this.finalUrl =
       allowedSanitizedUrl(initialUrl, allowedOrigins)?.url ?? null;
+  }
+
+  startLifecycle(timestamp: number): void {
+    this.#lifecycleStart = timestamp;
   }
 
   ingest(event: CdpEvent): void {
@@ -317,6 +355,13 @@ class TimelineCapture {
 
   #lifecycle(params: UnknownRecord): void {
     if (cdpStringValue(params.frameId) !== this.mainFrameId) return;
+    const timestamp = numberValue(params.timestamp);
+    if (timestamp === undefined || timestamp < 0) {
+      this.completeness.exclude("timeline", "invalid_protocol_value");
+      return;
+    }
+    if (this.#lifecycleStart === undefined || timestamp < this.#lifecycleStart)
+      return;
     this.#add({
       type: "lifecycle",
       params,
