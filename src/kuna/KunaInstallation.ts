@@ -287,6 +287,31 @@ export const inspectKunaInstallation = async (
 
   assertRegularFileActive(options.signal);
 
+  let preProbeHash: { readonly sha256: string; readonly bytes: number };
+  try {
+    preProbeHash = await options.fileCloseResources.run(async () =>
+      hashStableFile(executable, {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        retainFailedClose: (owner) =>
+          options.fileCloseResources.retain(owner, executable),
+      }),
+    );
+  } catch (cause: unknown) {
+    if (
+      cause instanceof Error &&
+      (cause instanceof RegularFileCleanupFailure ||
+        regularFileCancellation(cause) !== undefined)
+    )
+      throw cause;
+    return failure(
+      "executable_missing",
+      `Cannot fingerprint ${executable}: ${message(stableFileHashCause(cause))}`,
+      { command, executable },
+    );
+  }
+
+  assertRegularFileActive(options.signal);
+
   const deadline = options.probeTimeoutMs ?? VERSION_PROBE_TIMEOUT_MS;
   let snapshot: ProviderProcessSnapshot;
   try {
@@ -459,6 +484,19 @@ export const inspectKunaInstallation = async (
       { command, executable },
     );
   }
+
+  if (fingerprint.sha256 !== preProbeHash.sha256)
+    return failure(
+      "version_unresolved",
+      `${executable} was replaced during the version probe; the digest does not match the probed bytes. Re-inspect to obtain a consistent version and fingerprint.`,
+      {
+        command,
+        executable,
+        version,
+        pre_probe_sha256: preProbeHash.sha256,
+        post_probe_sha256: fingerprint.sha256,
+      },
+    );
 
   return ok({
     configuration: configuration.value,
