@@ -1010,7 +1010,18 @@ One session contains exactly one imported Program; use `provider_id: "ghidra"`, 
 One persistent decompiler is owned by the Program, and a serial queue keeps
 Ghidra API calls on the owning Program thread without a fixed queue length.
 Operations run until a result, caller cancellation, or provider shutdown; there
-is no fixed per-operation or response-size ceiling. Unresolved computed calls
+is no fixed per-operation or response-size ceiling. Cancelling an operation that
+is already running stops the Ghidra session, so one function whose
+decompilation runs past the MCP client's deadline costs the whole import.
+`REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS` (an integer from 1 to 86,400; absent by
+default, which leaves decompilation unbounded) bounds each native decompile
+instead. Ghidra stops that one decompile and starts a fresh decompiler process
+for the next request. `analyze_function` still returns the function's assembly,
+references and basic blocks, with pseudocode, `native_api` and
+`native_value_flow` unavailable for the reason "exceeded the N-second limit",
+and that dossier is not saved to analysis snapshots. `procedure_pseudo_code`
+fails with that message. The limit is read when a Ghidra session starts. Ghidra's
+own interactive default is 30 seconds. Unresolved computed calls
 remain unknown, reference-kind provenance is preserved, and provider-specific
 pseudocode is never treated as original source or Hopper-equivalent text.
 

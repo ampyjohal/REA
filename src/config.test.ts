@@ -464,3 +464,44 @@ describe("default macOS Hopper launcher", () => {
     });
   });
 });
+
+describe("Ghidra decompile limit configuration", () => {
+  it.each([
+    [undefined, undefined],
+    ["1", 1],
+    ["30", 30],
+    ["86400", 86_400],
+  ] as const)(
+    "reads the Ghidra decompile limit %j as %j seconds",
+    (value, expected) => {
+      const result = parseConfig(
+        value === undefined
+          ? {}
+          : { REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS: value },
+      );
+      if (!result.ok) throw result.error;
+      expect(result.value.ghidraDecompileTimeoutSeconds).toBe(expected);
+    },
+  );
+
+  it.each(["", "0", "-1", "1.5", "30s", "86401"])(
+    "rejects malformed Ghidra decompile limit %j with its setting",
+    (value) => {
+      const result = parseConfig({
+        REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS: value,
+      });
+      if (result.ok) throw new Error("Expected invalid decompile limit");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "configuration_invalid",
+        details: {
+          settings: [
+            {
+              setting: "REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS",
+              constraint: expect.any(String),
+            },
+          ],
+        },
+      });
+    },
+  );
+});

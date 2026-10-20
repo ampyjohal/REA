@@ -1342,6 +1342,48 @@ describe("Ghidra decompiler failure projection", () => {
       expect(projected.remediation.action).not.toContain("rea doctor");
     }
   });
+
+  it("names the decompile limit when one procedure's decompilation times out", async () => {
+    const code = "decompile_timed_out";
+    const message =
+      "Ghidra decompilation of 0x401000 exceeded the 5-second limit set by REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS";
+    const ghidra = provider(installationHost(), () => ({
+      start: () => Promise.resolve(ok(sessionInfo())),
+      callTool: () =>
+        Promise.resolve(
+          err(
+            new GhidraSessionError(
+              "remote",
+              message,
+              { remote_code: code },
+              { remoteCode: code },
+            ),
+          ),
+        ),
+      close: () => Promise.resolve(ok(null)),
+    }));
+    const client = await createElfClient(ghidra);
+    const result = await client.execute("procedure_pseudo_code", {
+      procedure: "main",
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "ProviderAdapterError" },
+    });
+    if (!result.ok) {
+      const projected = projectAnalysisError(result.error);
+      expect(projected).toMatchObject({
+        code: "execution_failure",
+        message: `${message}. Only this procedure's decompilation was stopped; the Ghidra session remains usable.`,
+        details: { diagnostics: { remote_code: code } },
+      });
+      expect(projected.remediation.action).toContain("analyze_function");
+      expect(projected.remediation.action).toContain(
+        "REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS",
+      );
+      expect(projected.remediation.action).not.toContain("rea doctor");
+    }
+  });
 });
 
 describe("Ghidra PE CodeView debug symbol limitations", () => {

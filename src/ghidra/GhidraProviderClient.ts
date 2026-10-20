@@ -379,6 +379,9 @@ export const createGhidraProviderClient = (input: {
       ...(config.ghidraDisabledAnalyzers === undefined
         ? {}
         : { disabledAnalyzers: config.ghidraDisabledAnalyzers }),
+      ...(config.ghidraDecompileTimeoutSeconds === undefined
+        ? {}
+        : { decompileTimeoutSeconds: config.ghidraDecompileTimeoutSeconds }),
       ...(seeds === undefined ? {} : { analysisSeeds: seeds }),
       platform: installation.platform,
       ...(extensions.length === 0 ? {} : { analysisExtensions: extensions }),
@@ -916,6 +919,13 @@ const projectPrimarySessionError = (
       userMessage: `${failure.message.trim().replace(/\.$/u, "")}. Only the decompiler failed for this procedure; the Ghidra session remains usable.`,
       remediationAction:
         "Call analyze_function (CLI: `rea function`) for the same procedure. It returns assembly, callers, callees, references and basic blocks from the Ghidra listing and records this decompiler failure under facet_availability.pseudocode. Repeating the unchanged decompile request is not expected to succeed.",
+    });
+  if (failure.kind === "remote" && failure.remoteCode === "decompile_timed_out")
+    return new ProviderAdapterError("ghidra", operation, {
+      ...context,
+      userMessage: `${failure.message.trim().replace(/\.$/u, "")}. Only this procedure's decompilation was stopped; the Ghidra session remains usable.`,
+      remediationAction:
+        "Call analyze_function (CLI: `rea function`) for the same procedure to get its assembly, callers, callees, references and basic blocks without pseudocode. To allow a longer decompile, raise REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS in the environment that starts REA; the limit applies to Ghidra sessions started after the change. Repeating the unchanged decompile request under the same limit is not expected to succeed.",
     });
   if (failure.kind === "analysis_timeout")
     return new AnalysisTimeoutError(

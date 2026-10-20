@@ -153,6 +153,11 @@ try {
       "failure_limitation_named",
       "pseudocode_request_still_fails",
       "cancellation_still_ends_request",
+      "timed_out_decompile_is_live",
+      "timed_out_pseudocode_names_limit",
+      "timed_out_native_api_names_limit",
+      "timed_out_listing_unchanged",
+      "timed_out_pseudocode_request_names_limit",
       "session_recovers_after_failure",
     ])
       assert.ok(probe.checks.includes(check), check);

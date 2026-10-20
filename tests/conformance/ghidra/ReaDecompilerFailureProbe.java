@@ -189,6 +189,37 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
                     failureCode(failure.getCause()).equals("decompile_cancelled"));
             }
 
+            // A decompile that reaches REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS degrades the
+            // same way, names the setting, and stays out of snapshots.
+            Field limit = bridge.getClass().getDeclaredField("decompileTimeoutSeconds");
+            limit.setAccessible(true);
+            limit.setInt(bridge, 5);
+            String limitText = "exceeded the 5-second limit set by REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS";
+            decompiler.set(bridge, failing(target, DisposeState.DISPOSED_ON_TIMEOUT));
+            JsonObject timedOut = (JsonObject) analyze.invoke(bridge, request, null);
+            JsonObject timedOutDossier = timedOut.getAsJsonObject("value");
+            require("timed_out_decompile_is_live",
+                timedOut.has("cache_policy") && timedOut.get("cache_policy").getAsString().equals("live"));
+            String timedOutReason = reason(timedOutDossier.getAsJsonObject("facet_availability")
+                .getAsJsonObject("pseudocode"));
+            require("timed_out_pseudocode_names_limit", timedOutReason != null &&
+                timedOutReason.startsWith("Ghidra decompilation of ") && timedOutReason.endsWith(limitText));
+            require("timed_out_native_api_names_limit",
+                !timedOutDossier.getAsJsonObject("native_api").get("available").getAsBoolean() &&
+                timedOutReason.equals(reason(timedOutDossier.getAsJsonObject("native_api"))));
+            require("timed_out_listing_unchanged",
+                timedOutDossier.get("assembly").equals(value.get("assembly")) &&
+                timedOutDossier.get("basic_blocks").equals(value.get("basic_blocks")));
+            try {
+                pseudocode.invoke(bridge, pseudocodeQuery);
+                throw new IllegalStateException("Timed-out pseudocode request unexpectedly succeeded");
+            } catch (InvocationTargetException failure) {
+                require("timed_out_pseudocode_request_names_limit",
+                    failureCode(failure.getCause()).equals("decompile_timed_out") &&
+                    failure.getCause().getMessage().endsWith(limitText));
+            }
+            limit.setInt(bridge, 0);
+
             decompiler.set(bridge, real);
             JsonObject recovered = (JsonObject) analyze.invoke(bridge, request, null);
             require("session_recovers_after_failure", recovered.getAsJsonObject("value")
