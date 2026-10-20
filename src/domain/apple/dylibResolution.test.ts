@@ -840,6 +840,54 @@ describe("lazily loaded dependencies", () => {
       "lazy-load-unresolved",
     ]);
   });
+
+  it("resolves LC_LAZY_LOAD_DYLIB_INFO without traversing it", async () => {
+    const trace = await traceDylibLoading(
+      memoryView({
+        [MAIN]: executable({
+          rpaths: ["@executable_path/../Frameworks"],
+          dependencies: [
+            dependency("@rpath/libinfo.dylib", {
+              command: "LC_LAZY_LOAD_DYLIB_INFO",
+              encoding: "lazy_load_dylib_info",
+              weak: true,
+              current_version: null,
+              compatibility_version: null,
+            }),
+            dependency("@rpath/libmissing.dylib", {
+              command: "LC_LAZY_LOAD_DYLIB_INFO",
+              encoding: "lazy_load_dylib_info",
+              current_version: null,
+              compatibility_version: null,
+            }),
+          ],
+        }),
+        "Contents/Frameworks/libinfo.dylib": parsed(
+          slice({ dependencies: [dependency("@rpath/libdeep.dylib")] }),
+        ),
+      }),
+      { roots: [MAIN] },
+    );
+    expect(trace.edges.map(({ install_name: name }) => name)).toEqual([
+      "@rpath/libinfo.dylib",
+      "@rpath/libmissing.dylib",
+    ]);
+    expect(trace.edges[0]).toMatchObject({
+      command: "LC_LAZY_LOAD_DYLIB_INFO",
+      encoding: "lazy_load_dylib_info",
+      weak: true,
+      current_version: null,
+      compatibility_version: null,
+      resolution: {
+        status: "resolved",
+        image: "Contents/Frameworks/libinfo.dylib",
+      },
+    });
+    expect(trace.coverage.status).toBe("complete");
+    expect(trace.findings.map(({ kind }) => kind)).toEqual([
+      "lazy-load-unresolved",
+    ]);
+  });
 });
 
 describe("conditional loads", () => {

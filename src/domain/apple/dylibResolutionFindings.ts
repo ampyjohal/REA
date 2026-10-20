@@ -1,8 +1,15 @@
 import type {
   DylibEdge as Edge,
   DylibFinding as Finding,
+  MachoDependency,
   MachoSlice,
 } from "./dylibResolution.js";
+
+/** Both lazy encodings load on first use and are not process-launch dependencies. */
+export const isLazyLoadCommand = (
+  command: MachoDependency["command"],
+): boolean =>
+  command === "LC_LAZY_LOAD_DYLIB" || command === "LC_LAZY_LOAD_DYLIB_INFO";
 
 /** One traced process root with the exact slice it was traced from. */
 export interface TracedRootSlice {
@@ -62,12 +69,12 @@ const unresolvedFinding = (edge: Edge, index: number): Finding => {
     image: edge.loader,
     basis: "derived",
   } as const;
-  const missing = `No candidate for ${edge.command === "LC_LAZY_LOAD_DYLIB" ? "lazily loaded " : edge.weak ? "weak dependency " : ""}${edge.install_name} exists in the analyzed root`;
+  const missing = `No candidate for ${isLazyLoadCommand(edge.command) ? "lazily loaded " : edge.weak ? "weak dependency " : ""}${edge.install_name} exists in the analyzed root`;
   // Below a conditional fallback, every consequence applies only if it loads.
   const when = edge.loader_conditional
     ? `. ${edge.loader} loads only conditionally; if it loads, `
     : "; ";
-  if (edge.command === "LC_LAZY_LOAD_DYLIB")
+  if (isLazyLoadCommand(edge.command))
     return {
       ...base,
       kind: "lazy-load-unresolved",
@@ -87,7 +94,7 @@ const unresolvedFinding = (edge: Edge, index: number): Finding => {
 };
 
 export const DYLIB_RESOLUTION_LIMITATIONS = [
-  "LC_LAZY_LOAD_DYLIB dependencies are resolved but not traversed, because dyld loads them only on first use.",
+  "LC_LAZY_LOAD_DYLIB and LC_LAZY_LOAD_DYLIB_INFO dependencies are resolved but not traversed, because dyld loads them only on first use.",
   "Slices are matched by dyld's graded architectures (an x86_64h process also loads x86_64). arm64e processes that disable pointer authentication can also load arm64 slices; that fallback is not modeled.",
   "Absolute install names and rpaths are outside the analyzed root and are not evaluated, including /System and /usr/lib libraries that the dyld shared cache usually provides.",
   "Leaf and relative install names depend on dyld fallback paths, DYLD_* variables, and the working directory; they are undetermined.",
