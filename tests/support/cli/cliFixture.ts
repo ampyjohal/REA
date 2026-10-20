@@ -65,9 +65,10 @@ const startupFailureWithCleanup = (
 };
 
 /**
- * Start at most one server for the file, including after a failed handshake.
- * Close waits for startup still in flight. A connector that sees `isClosed`
- * can skip the server; a server registered after close is still cleaned up.
+ * Start at most one server for the file. Close waits for startup still in
+ * flight. A connector that sees `isClosed` can skip the server; a server
+ * registered after close is still cleaned up. A failed cleanup stays owned,
+ * and the next call does not open another server until that cleanup succeeds.
  */
 export const createSharedMcpSession = (
   connect: (
@@ -120,14 +121,21 @@ export const createSharedMcpSession = (
     session: {
       call: () => {
         if (closed) return Promise.reject(sharedMcpSessionClosed());
-        pending ??= connect(registerCleanup, () => closed)
-          .then((call) => {
-            if (closed) throw sharedMcpSessionClosed();
-            return call;
-          })
-          .catch(async (error: unknown) => {
+        pending ??= (async () => {
+          try {
+            if (cleanups.length > 0) await drain();
+          } catch (cleanupError) {
             // Close owns cleanup once shutdown has started, so a failed
-            // handshake cannot clear the in-flight startup close is awaiting.
+            // handshake cannot clear the startup close is awaiting.
+            if (!closed) pending = undefined;
+            throw cleanupError;
+          }
+          if (closed) throw sharedMcpSessionClosed();
+          try {
+            const opened = await connect(registerCleanup, () => closed);
+            if (closed) throw sharedMcpSessionClosed();
+            return opened;
+          } catch (error) {
             if (!closed) {
               pending = undefined;
               try {
@@ -137,7 +145,8 @@ export const createSharedMcpSession = (
               }
             }
             throw error;
-          });
+          }
+        })();
         return pending;
       },
     },

@@ -172,6 +172,54 @@ test("retries a reasonless MCP cleanup rejection on a later close", async () => 
   expect(attempts).toBe(3);
 });
 
+test("does not open another MCP server while failed cleanup is retained", async () => {
+  const startup = new Error("handshake failed");
+  const cleanup = new Error("teardown failed");
+  let openings = 0;
+  let attempts = 0;
+  let failCleanup = true;
+  const session = createSharedMcpSession(async (registerCleanup) => {
+    openings += 1;
+    registerCleanup(async () => {
+      attempts += 1;
+      if (failCleanup) throw cleanup;
+    });
+    throw startup;
+  });
+  const first = await session.session.call().then(
+    () => {
+      throw new Error("startup succeeded");
+    },
+    (error: unknown) => error,
+  );
+  expect(first).toBeInstanceOf(Error);
+  if (!(first instanceof Error)) throw new Error("expected startup failure");
+  expect(first.message).toBe(startup.message);
+  expect(openings).toBe(1);
+  expect(attempts).toBe(1);
+
+  const blocked = await session.session.call().then(
+    () => {
+      throw new Error("startup succeeded");
+    },
+    (error: unknown) => error,
+  );
+  expect(blocked).toBe(cleanup);
+  expect(openings).toBe(1);
+  expect(attempts).toBe(2);
+
+  failCleanup = false;
+  const reopened = await session.session.call().then(
+    () => {
+      throw new Error("startup succeeded");
+    },
+    (error: unknown) => error,
+  );
+  expect(reopened).toBe(startup);
+  expect(openings).toBe(2);
+  expect(attempts).toBe(4);
+});
+
 test("closes a shared MCP server registered after file cleanup starts", async () => {
   const startup = held();
   let closedServer = false;
