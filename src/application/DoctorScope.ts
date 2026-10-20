@@ -1,4 +1,5 @@
 import { uniqueSorted } from "../domain/canonicalOrdering.js";
+import { blocksProcessStart } from "../logger.js";
 import type {
   ClientRegistrationStatus,
   UnhealthyClientRegistrationStatus,
@@ -80,8 +81,37 @@ export const scopeDoctorChecks = (
   const hopperHostChecks = input.scope.providers.includes("hopper")
     ? input.checks.filter(({ name }) => name === "host")
     : [];
+  // A process-start failure blocks the client and skill even with no provider.
+  const blocksProcess = (check: DoctorCheck): boolean => {
+    const setting = check.details?.setting;
+    return (
+      check.name.startsWith("runtime-configuration:") &&
+      typeof setting === "string" &&
+      blocksProcessStart(setting)
+    );
+  };
+  const processStartChecks = input.checks.filter(blocksProcess);
+  // Remaining admission failures block the selected native engine.
+  const nativeConfigurationChecks =
+    input.scope.providers.length > 0
+      ? input.checks.filter(
+          (check) =>
+            check.name.startsWith("runtime-configuration:") &&
+            !blocksProcess(check),
+        )
+      : [];
+  // The Hopper timeout is parsed before every native engine. Hopper's own
+  // scope already includes hopper-startup-timeout.
+  const sharedHopperTimeoutChecks =
+    input.scope.providers.length > 0 &&
+    !input.scope.providers.includes("hopper")
+      ? input.checks.filter(({ name }) => name === "hopper-startup-timeout")
+      : [];
   const scopeChecks = [
     ...coreChecks,
+    ...processStartChecks,
+    ...nativeConfigurationChecks,
+    ...sharedHopperTimeoutChecks,
     ...hopperHostChecks,
     ...selectedProviderChecks,
     ...clientChecks,
@@ -91,6 +121,9 @@ export const scopeDoctorChecks = (
   return {
     healthy:
       coreChecks.every(({ ok }) => ok) &&
+      processStartChecks.every(({ ok }) => ok) &&
+      nativeConfigurationChecks.every(({ ok }) => ok) &&
+      sharedHopperTimeoutChecks.every(({ ok }) => ok) &&
       hopperHostChecks.every(({ ok }) => ok) &&
       clientChecks.every(({ ok }) => ok) &&
       skillChecks.every(({ ok }) => ok) &&
