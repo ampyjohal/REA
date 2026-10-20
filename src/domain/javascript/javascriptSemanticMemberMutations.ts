@@ -35,6 +35,7 @@ import {
   type SemanticIterationSource,
 } from "./javascriptSemanticIterationSources.js";
 import { semanticCallableResultExpressions } from "./javascriptSemanticCallableResults.js";
+import { semanticNativePromiseProducer } from "./javascriptSemanticPromiseIdentity.js";
 import { createSemanticReturnedReferences } from "./javascriptSemanticReturnedReferences.js";
 import { semanticMutationInitializers } from "./javascriptSemanticMutationInitializers.js";
 import {
@@ -164,6 +165,11 @@ export function* collectSemanticMemberMutationsSteps(
     t.CallExpression | t.OptionalCallExpression
   >();
   const parents = state.parentsByNode;
+  const literalEffects: NonNullable<
+    JavaScriptSemanticAnalysisState["literalMemberEffects"]
+  > = new WeakMap();
+  state.literalMemberEffects = literalEffects;
+  const recordedLiteralEffects = new WeakMap<t.Node, Set<string>>();
   const observablePaths = observableMutationPaths(state);
   const returnedReferences = createSemanticReturnedReferences(state);
   const recordedRequiredEffects = new Set<string>();
@@ -211,7 +217,7 @@ export function* collectSemanticMemberMutationsSteps(
   };
   // Ambient indexing owns aliases of global objects. Consume its canonical
   // writes instead of reparsing qualified or aliased process assignments.
-  for (const { path, node } of state.ambientWriteEffects)
+  for (const { path, node, kind } of state.ambientReferenceEffects)
     if (
       path[0] === "global" &&
       path[1] === "process" &&
@@ -219,7 +225,7 @@ export function* collectSemanticMemberMutationsSteps(
       node !== undefined &&
       semanticOriginalGlobalProcessAt(node, state)
     )
-      recordRequiredEffect("node:process", path.slice(2), "write", node);
+      recordRequiredEffect("node:process", path.slice(2), kind, node);
   const selections = new Map<string, readonly string[]>();
   const coveringPaths = new Map<string, SemanticPropertyPathCoverage>();
   state.arrayIterationUnknown = false;
@@ -622,6 +628,30 @@ export function* collectSemanticMemberMutationsSteps(
           originAt: current.originAt,
         });
       } else {
+        if (
+          t.isObjectExpression(expression) ||
+          t.isArrayExpression(expression) ||
+          t.isFunction(expression)
+        ) {
+          // A literal may escape through an assignment result before another
+          // binding projects it. Retain effects on the allocation itself,
+          // including writes that stop at an owned slot rather than its value.
+          const identity = JSON.stringify([
+            effect,
+            current.path,
+            mutation?.start,
+            mutation?.end,
+          ]);
+          const recorded = recordedLiteralEffects.get(expression) ?? new Set();
+          if (!recorded.has(identity)) {
+            recorded.add(identity);
+            recordedLiteralEffects.set(expression, recorded);
+            const effects = literalEffects.get(expression) ?? [];
+            effects.push({ kind: effect, path: current.path, node: mutation });
+            literalEffects.set(expression, effects);
+            recordedEffectCount += 1;
+          }
+        }
         for (const value of effect === "escape"
           ? escapedReferenceLeaves(
               expression,
@@ -1293,8 +1323,9 @@ const observableMutationPaths = (
         // Keep class/getter projections distinct so cycle pruning does not
         // discard observable escapes through a shared getter result.
         if (
-          t.isNewExpression(expression) &&
-          semanticClassCandidates(expression.callee, state).length === 0
+          semanticNativePromiseProducer(expression, state) ||
+          (t.isNewExpression(expression) &&
+            semanticClassCandidates(expression.callee, state).length === 0)
         )
           (observer.origins ??= new Set()).add("opaque");
         else if (

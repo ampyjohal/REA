@@ -14,6 +14,7 @@ import {
   argumentValue,
   calleeName,
   endpointArgument as endpointArgumentHelper,
+  isWebSocketEndpointCandidate,
   prefixedArgument,
   range,
   rangeForOffsets,
@@ -480,8 +481,8 @@ const inspectEndpointCall = (
     if (
       endpointArgumentHelper(
         name,
-        node.arguments,
-        node.callee,
+        node,
+        bindings,
         context.openReceiverFacts?.get(node.start ?? -1),
       ) === undefined
     )
@@ -493,21 +494,17 @@ const inspectEndpointCall = (
       return;
     }
   }
-  inspectLiteralEndpointCall(node, name, context);
+  inspectLiteralEndpointCall(node, name, context, bindings);
 };
 
 const inspectLiteralEndpointCall = (
   node: JavaScriptCallLike,
   name: string,
   context: FindingContext,
+  bindings: JavaScriptSemanticAnalysisState,
 ): void => {
   const receiverFact = context.openReceiverFacts?.get(node.start ?? -1);
-  const endpoint = endpointArgumentHelper(
-    name,
-    node.arguments,
-    node.callee,
-    receiverFact,
-  );
+  const endpoint = endpointArgumentHelper(name, node, bindings, receiverFact);
   if (endpoint !== undefined)
     addEndpoint(context, {
       node,
@@ -540,7 +537,7 @@ const isKnownNetworkRequest = (
     return true;
   if (
     t.isNewExpression(node) &&
-    (isUnmodifiedGlobalReference(node.callee, bindings, "WebSocket") ||
+    (isWebSocketEndpointCandidate(node.callee, bindings) ||
       isUnmodifiedGlobalReference(node.callee, bindings, "EventSource"))
   )
     return true;
@@ -562,7 +559,7 @@ export const finishPartialNetworkEndpoints = (
   for (const { node, name } of context.accumulator.pendingNetworkCalls) {
     if (!isKnownNetworkRequest(node, bindings)) {
       if (!isIntrinsicMapLookup(node, bindings, index))
-        inspectLiteralEndpointCall(node, name, context);
+        inspectLiteralEndpointCall(node, name, context, bindings);
       continue;
     }
     const target = argumentNode(node.arguments[0]);
