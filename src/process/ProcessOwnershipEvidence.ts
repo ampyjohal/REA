@@ -222,12 +222,10 @@ export class ProcessOwnershipEvidenceOwner {
       // bounded observations, not claims about later PID reuse or global
       // liveness.
       if (
-        fact.state === "absent" ||
+        processIdentityHasExited(fact.identityAfter) ||
         (previous.identity !== undefined &&
           fact.identityAfter.state === "readable" &&
-          fact.identityAfter.identity !== previous.identity) ||
-        (fact.state === "same-generation" &&
-          processIdentityHasExited(fact.identityAfter))
+          fact.identityAfter.identity !== previous.identity)
       ) {
         this.#candidates.delete(pid);
         retiredPids.add(pid);
@@ -289,9 +287,7 @@ export class ProcessOwnershipEvidenceOwner {
       if (
         this.#candidates.has(pid) ||
         (retiredPids.has(pid) && fact.state !== "same-generation") ||
-        fact.state === "absent" ||
-        (fact.state === "same-generation" &&
-          processIdentityHasExited(fact.identityAfter))
+        processIdentityHasExited(fact.identityAfter)
       )
         continue;
       const identity = fact.identityAfter;

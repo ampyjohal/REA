@@ -1,6 +1,14 @@
 import { uniqueSorted } from "../canonicalOrdering.js";
 import type { AnalysisViewCoverage } from "./analysisView.js";
 
+/** No selected inference was examined; neither total nor exhaustion is established. */
+export const unknownViewCoverage = (): AnalysisViewCoverage => ({
+  status: "unknown",
+  examined: 0,
+  total: null,
+  next_offset: null,
+  exhausted: null,
+});
 /** Coverage for a summary, facet, or single selected object. */
 export const completeWithinViewCoverage = (
   examined: number,

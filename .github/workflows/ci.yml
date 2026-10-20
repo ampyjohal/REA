@@ -505,7 +505,7 @@ jobs:
   windows-native-build:
     name: Build bundled Windows x64 native controls
     needs: [changes, static]
-    if: needs.changes.outputs.runtime == 'true'
+    if: needs.changes.outputs.runtime == 'true' || needs.changes.outputs.evm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -873,11 +873,12 @@ jobs:
       build_cache_artifact: rea-build-cache
 
   evm:
-    needs: [changes, static, build]
+    needs: [changes, static, build, windows-native-build]
     if: needs.changes.outputs.evm == 'true'
     uses: ./.github/workflows/real-evm-interface.yml
     with:
       build_cache_artifact: rea-build-cache
+      windows_native_artifact: windows-native-controls
 
   javascript_recovery:
     needs: [changes, static, build]

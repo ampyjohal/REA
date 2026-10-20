@@ -35,6 +35,69 @@ const scopeFlags = async () =>
       ),
     ).CI_FLAGS;
 
+it("prepares matching Windows controls before EVM portability setup", async () => {
+  const ci = await workflow();
+  expect(ci.jobs.evm?.needs).toContain("windows-native-build");
+  expect(ci.jobs.evm?.with).toMatchObject({
+    windows_native_artifact: "windows-native-controls",
+  });
+  expect(ci.jobs["windows-native-build"]?.if).toBe(
+    "needs.changes.outputs.runtime == 'true' || needs.changes.outputs.evm == 'true'",
+  );
+  const evm = await workflow("real-evm-interface.yml");
+  const steps = z
+    .array(
+      z.object({
+        uses: z.string().optional(),
+        run: z.string().optional(),
+        if: z.string().optional(),
+        with: z.record(z.string(), z.unknown()).optional(),
+      }),
+    )
+    .parse(evm.jobs["compiler-artifact-portability"]?.steps);
+  const download = steps.findIndex((step) =>
+    step.uses?.startsWith("actions/download-artifact@"),
+  );
+  const verify = steps.findIndex(
+    (step) => step.run === "npm run verify:windows-native:artifact",
+  );
+  const cache = steps.findIndex(
+    (step) => step.uses === "./.github/actions/portable-build-cache",
+  );
+  expect(download).toBeGreaterThan(-1);
+  expect(verify).toBeGreaterThan(download);
+  expect(cache).toBeGreaterThan(verify);
+  expect(steps[download]).toMatchObject({
+    if: "runner.os == 'Windows'",
+    with: {
+      name: "${{ inputs.windows_native_artifact || 'evm-windows-native-controls' }}",
+      path: "native/windows/build/",
+    },
+  });
+  expect(steps[verify]?.if).toBe("runner.os == 'Windows'");
+  expect(evm.jobs["compiler-artifact-portability"]?.needs).toBe(
+    "real-evm-interface",
+  );
+  const producer = z
+    .array(
+      z.object({
+        uses: z.string().optional(),
+        if: z.string().optional(),
+        with: z.record(z.string(), z.unknown()).optional(),
+      }),
+    )
+    .parse(evm.jobs["real-evm-interface"]?.steps);
+  expect(
+    producer.find((step) => step.uses?.startsWith("actions/upload-artifact@")),
+  ).toMatchObject({
+    if: "inputs.windows_native_artifact == ''",
+    with: {
+      name: "evm-windows-native-controls",
+      path: "native/windows/build/",
+    },
+  });
+});
+
 it("binds SQLite compatibility jobs to the build's prepared runtime artifact and root layout", async () => {
   expect((await workflow()).jobs["sqlite-runtime"]?.if).toBe(
     "needs.changes.outputs.sqlite == 'true'",
@@ -239,7 +302,12 @@ it("binds provider build reuse to the current run while keeping standalone dispa
   for (const name of consumers) {
     const caller = jobs[name];
     expect(caller?.needs).toContain("build");
-    expect(caller?.with).toEqual({ build_cache_artifact: "rea-build-cache" });
+    expect(caller?.with).toEqual({
+      build_cache_artifact: "rea-build-cache",
+      ...(name === "evm"
+        ? { windows_native_artifact: "windows-native-controls" }
+        : {}),
+    });
     const path = z.string().parse(caller?.uses);
     const called = z
       .object({
@@ -278,6 +346,9 @@ it("binds provider build reuse to the current run while keeping standalone dispa
         )?.with,
       ).toEqual({ build_cache_artifact: "${{ inputs.build_cache_artifact }}" });
   }
+});
+
+it("keeps standalone build-cache lookup separate from current-run artifacts", async () => {
   const action = z
     .object({
       runs: z.object({

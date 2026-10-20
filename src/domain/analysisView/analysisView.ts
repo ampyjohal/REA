@@ -308,13 +308,22 @@ export const inspectAnalysisViewInputSchema = z.strictObject({
   view: analysisViewRequestSchema,
 });
 
-const coverageSchema = z.strictObject({
-  status: z.enum(["complete-within-view", "page", "empty"]),
-  examined: z.number().int().nonnegative(),
-  total: z.number().int().nonnegative(),
-  next_offset: z.number().int().nonnegative().nullable(),
-  exhausted: z.boolean(),
-});
+const coverageSchema = z.union([
+  z.strictObject({
+    status: z.enum(["complete-within-view", "page", "empty"]),
+    examined: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+    next_offset: z.number().int().nonnegative().nullable(),
+    exhausted: z.boolean(),
+  }),
+  z.strictObject({
+    status: z.literal("unknown"),
+    examined: z.literal(0),
+    total: z.null(),
+    next_offset: z.null(),
+    exhausted: z.null(),
+  }),
+]);
 
 const artifactSchema = z.strictObject({
   path: z

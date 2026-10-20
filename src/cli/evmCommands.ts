@@ -1,6 +1,8 @@
 import { z } from "incur";
 import { evmInterfaceModule } from "../composition/evm.js";
 import { logCliCommand } from "../cliLogging.js";
+import { AnalysisInputError } from "../domain/analysisErrorCore.js";
+import { err } from "../domain/result.js";
 import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 import { withCommandCancellation } from "./commandCancellation.js";
@@ -17,23 +19,62 @@ export const registerEvmCommands = (
   cli.command(evmInterfaceModule.cliCommand, {
     description: "Infer interface candidates from explicit local EVM bytecode",
     args: z.object({
-      path: z.string().describe("Local bytecode carrier"),
+      path: z.string().describe("Local bytecode or compiler-output carrier"),
       encoding: z
-        .enum(["raw", "hex"])
+        .enum(["raw", "hex", "solc-json"])
         .describe("Selected carrier representation"),
     }),
-    run: ({ args }) =>
+    options: z.object({
+      "source-unit": z
+        .string()
+        .optional()
+        .describe("Exact compiler source-unit key for solc-json"),
+      "contract-name": z
+        .string()
+        .optional()
+        .describe("Exact compiler contract key for solc-json"),
+      "bytecode-kind": z
+        .enum(["creation", "deployed"])
+        .optional()
+        .describe("Selected compiler bytecode object"),
+    }),
+    run: ({ args, options }) =>
       withCommandCancellation((signal) =>
         logCliCommand(logger, evmInterfaceModule.cliCommand, () =>
           finishAnalysisCommand(
-            () =>
-              service.inspect(
+            async () => {
+              if (
+                args.encoding !== "solc-json" &&
+                (options["source-unit"] !== undefined ||
+                  options["contract-name"] !== undefined ||
+                  options["bytecode-kind"] !== undefined)
+              )
+                return err(
+                  new AnalysisInputError("inspect_evm_interface", undefined, [
+                    {
+                      path: ["encoding"],
+                      reason: "invalid_value",
+                      message:
+                        "Compiler selection options require solc-json encoding.",
+                    },
+                  ]),
+                );
+              return service.inspect(
                 {
                   path: absoluteCallerPath(args.path),
-                  encoding: args.encoding,
+                  encoding:
+                    args.encoding === "solc-json"
+                      ? {
+                          kind: "solc-json",
+                          source_unit: options["source-unit"],
+                          contract_name: options["contract-name"],
+                          bytecode_kind: options["bytecode-kind"],
+                        }
+                      : args.encoding,
                 },
                 { signal },
-              ),
+              );
+            },
             service,
             "evmole-interface",
             "inspect_evm_interface",
