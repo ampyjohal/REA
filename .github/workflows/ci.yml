@@ -53,6 +53,7 @@ jobs:
       workflows: ${{ steps.plan.outputs.workflows }}
       browser: ${{ steps.plan.outputs.browser }}
       binary_layout: ${{ steps.plan.outputs.binary_layout }}
+      reverse_providers: ${{ steps.plan.outputs.reverse_providers }}
       evm: ${{ steps.plan.outputs.evm }}
       javascript_recovery: ${{ steps.plan.outputs.javascript_recovery }}
       recorded_crash: ${{ steps.plan.outputs.recorded_crash }}
@@ -298,6 +299,7 @@ jobs:
       needs.changes.outputs.code == 'true' ||
       needs.changes.outputs.browser == 'true' ||
       needs.changes.outputs.binary_layout == 'true' ||
+      needs.changes.outputs.reverse_providers == 'true' ||
       needs.changes.outputs.evm == 'true' ||
       needs.changes.outputs.javascript_recovery == 'true' ||
       needs.changes.outputs.recorded_crash == 'true' ||
@@ -914,6 +916,12 @@ jobs:
     with:
       build_cache_artifact: rea-build-cache
 
+  reverse_providers:
+    needs: [changes, static, build]
+    if: needs.changes.outputs.reverse_providers == 'true'
+    uses: ./.github/workflows/real-reverse-providers.yml
+    with:
+      build_cache_artifact: rea-build-cache
   agentenv:
     needs: [changes, static, build]
     if: needs.changes.outputs.agentenv == 'true'
@@ -959,6 +967,7 @@ jobs:
         docs,
         browser,
         binary_layout,
+        reverse_providers,
         evm,
         javascript_recovery,
         recorded_crash,

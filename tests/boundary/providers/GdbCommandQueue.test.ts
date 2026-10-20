@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 
 import { GdbSessionManager } from "../../../src/gdb/GdbSessionManager.js";
+import { createProviderSpawnTracker } from "../../support/gdbProviderSpawnTracking.js";
 
 let directory: string | undefined;
 const managers: GdbSessionManager[] = [];
+const providerSpawns = createProviderSpawnTracker();
 
 afterEach(async () => {
   await Promise.all(
@@ -15,6 +17,7 @@ afterEach(async () => {
       .splice(0)
       .map((manager) => manager.closeAll().catch(() => undefined)),
   );
+  expect(await providerSpawns.killSurvivors()).toEqual([]);
   if (directory !== undefined)
     await rm(directory, { recursive: true, force: true });
   directory = undefined;
@@ -58,6 +61,7 @@ process.stdin.on("data", async (chunk) => {
   const manager = new GdbSessionManager({
     platform: "linux",
     environment: { REA_GDB_COMMAND: provider },
+    spawnProcess: providerSpawns.spawnProcess,
   });
   managers.push(manager);
   const started = await manager.start();

@@ -216,6 +216,7 @@ it("binds provider build reuse to the current run while keeping standalone dispa
     "evm",
     "javascript_recovery",
     "recorded_crash",
+    "reverse_providers",
     "web_network",
     "web_runtime",
     "web_source_map",

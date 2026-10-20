@@ -58,7 +58,9 @@ describe("Swift demangling CLI with line-terminator characters", () => {
         "--json",
       ],
       environment,
-      timeoutMs: 20_000,
+      // One CLI spawn: a loaded macOS runner exceeded 20 s here while the same
+      // invocation takes about a second on an idle host.
+      timeoutMs: 60_000,
     });
     expect(result.signal).toBeNull();
     expect(result.exitCode).toBe(1);

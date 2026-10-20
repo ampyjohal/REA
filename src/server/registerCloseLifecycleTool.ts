@@ -30,14 +30,35 @@ export const registerCloseLifecycleTool = ({
   logger,
   closeContract,
   closeProcessResources,
+  retryReverseEngineeringCleanup,
 }: LifecycleToolRegistration): void => {
   const closeWithResources = async <Value>(
-    closeSession: () => Promise<Result<Value, AnalysisError>>,
+    closeSession: (
+      afterResourceClose: () => Promise<void>,
+    ) => Promise<Result<Value, AnalysisError>>,
   ): Promise<Result<Value, AnalysisError>> => {
+    let reverseRetry:
+      | Promise<PromiseSettledResult<Result<null, AnalysisError>>>
+      | undefined;
+    const retryReverse = async (): Promise<void> => {
+      reverseRetry ??= Promise.allSettled([
+        Promise.resolve().then(() =>
+          closeResult(
+            async () =>
+              retryReverseEngineeringCleanup?.(closeContract.name) ?? ok(null),
+          ),
+        ),
+      ]).then(([result]) => result!);
+      await reverseRetry;
+    };
     const [sessionClose, resourceClose] = await Promise.allSettled([
-      closeResult(closeSession),
+      closeResult(() => closeSession(retryReverse)),
       closeResult(closeProcessResources),
     ]);
+    // Snapshot export/write or an unexpected session failure can return before
+    // the resource-close hook. Retry those owners once after the transition.
+    await retryReverse();
+    const reverseCleanup = await reverseRetry!;
     if (sessionClose.status === "rejected") {
       if (resourceClose.status === "rejected")
         logger.warn(
@@ -54,22 +75,38 @@ export const registerCloseLifecycleTool = ({
           { error: resourceClose.value.error.message },
           "Process capture cleanup failed while closing the session",
         );
+      if (reverseCleanup.status === "rejected")
+        logger.warn(
+          { error: String(reverseCleanup.reason) },
+          "Reverse-engineering cleanup threw while closing the session",
+        );
+      else if (!reverseCleanup.value.ok)
+        logger.warn(
+          { error: reverseCleanup.value.error.message },
+          "Reverse-engineering cleanup failed while closing the session",
+        );
       throw sessionClose.reason;
     }
     if (resourceClose.status === "rejected") throw resourceClose.reason;
+    if (reverseCleanup.status === "rejected") throw reverseCleanup.reason;
     const closed = sessionClose.value;
     const resources = resourceClose.value;
-    if (!closed.ok) {
-      if (!resources.ok)
-        return err(
-          analysisErrorWithCleanupFailure(
-            closed.error,
-            resources.error,
-          ).bindCleanupDependencies([closed.error, resources.error]),
-        );
-      return closed;
-    }
-    return resources.ok ? closed : resources;
+    const reverse = reverseCleanup.value;
+    // Keep live reverse ownership primary, but never let one successful retry
+    // acknowledge independent session or process-capture owners.
+    const failures = [
+      ...(reverse.ok ? [] : [reverse.error]),
+      ...(closed.ok ? [] : [closed.error]),
+      ...(resources.ok ? [] : [resources.error]),
+    ];
+    let failure = failures[0];
+    for (const next of failures.slice(1))
+      if (failure !== undefined)
+        failure = analysisErrorWithCleanupFailure(
+          failure,
+          next,
+        ).bindCleanupDependencies([failure, next]);
+    return failure === undefined ? closed : err(failure);
   };
   server.registerTool(
     closeContract.name,
@@ -81,7 +118,9 @@ export const registerCloseLifecycleTool = ({
         // Enqueue the lifecycle transition before awaiting progress transport so
         // a later open request cannot overtake this close.
         const closing = logToolExecution(logger, closeContract.name, () =>
-          closeWithResources(() => session.close({ progress })),
+          closeWithResources((afterResourceClose) =>
+            session.close({ progress, afterResourceClose }),
+          ),
         );
         await reportLifecycleStart(progress, closeContract.name);
         const closed = await closing;
@@ -89,9 +128,10 @@ export const registerCloseLifecycleTool = ({
         return server.delivery.toCallToolResult(closed, closeContract);
       }
       const closing = logToolExecution(logger, closeContract.name, () =>
-        closeWithResources(() =>
+        closeWithResources((afterResourceClose) =>
           session.closeWithSnapshot(snapshotPath, input.overwrite, {
             progress,
+            afterResourceClose,
           }),
         ),
       );

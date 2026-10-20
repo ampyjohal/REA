@@ -34,6 +34,12 @@ export interface SavedAnalysisSnapshot {
   readonly evidence_records: number;
 }
 
+/** Cleanup extension runs inside the close transition before final ownership checks. */
+export type BinarySessionCloseOptions = Pick<ExecutionOptions, "progress"> & {
+  readonly retainProviderDocuments?: boolean;
+  readonly afterResourceClose?: () => Promise<void>;
+};
+
 /** Target lifecycle used by CLI and MCP without exposing a concrete provider. */
 export interface BinarySessionPort
   extends AnalysisOperationPort, InvestigationRecordPort {
@@ -53,7 +59,9 @@ export interface BinarySessionPort
   withAdmittedExternalMutation<Value>(
     _path: string | undefined,
     signal: AbortSignal | undefined,
-    operation: () => Promise<Result<Value, AnalysisError>>,
+    operation: (
+      onDispatch: () => void,
+    ) => Promise<Result<Value, AnalysisError>>,
     retirementFailure: (
       value: Result<Value, AnalysisError>,
       error: AnalysisError,
@@ -62,7 +70,10 @@ export interface BinarySessionPort
     cleanupRecovery?: (
       failure: AnalysisError | undefined,
     ) => Promise<Result<null, AnalysisError>>,
+    mutationStart?: "admission" | "provider-dispatch",
   ): Promise<Result<Result<Value, AnalysisError>, AnalysisError>>;
+  /** Keep target lifecycle transitions blocked while an external writer runs. */
+  retainExternalMutationOwner?(completion: Promise<unknown>): void;
   open(
     path: string,
     options?: {
@@ -77,15 +88,13 @@ export interface BinarySessionPort
     },
   ): Promise<Result<BinaryTarget, AnalysisError>>;
   close(
-    options?: Pick<ExecutionOptions, "progress"> & {
-      readonly retainProviderDocuments?: boolean;
-    },
+    options?: BinarySessionCloseOptions,
   ): Promise<Result<null, AnalysisError>>;
   /** Save a snapshot and close while excluding later provider requests. */
   closeWithSnapshot(
     path: string,
     overwrite: boolean,
-    options?: Pick<ExecutionOptions, "progress">,
+    options?: BinarySessionCloseOptions,
   ): Promise<Result<SavedAnalysisSnapshot, AnalysisError>>;
   status(options?: { readonly signal?: AbortSignal }): Promise<JsonValue>;
   activeTarget(): BinaryTarget | undefined;
@@ -99,7 +108,6 @@ export interface BinarySessionPort
   ): AnalysisProfileCommitment | undefined;
   allowsSnapshotReplay(operation: AnalysisOperation): boolean;
   /** Invalidate cached Evidence before an external command may mutate the target. */
-  invalidateSnapshotForExternalMutation(): void;
   recordWorkflowSnapshot(
     input: WorkflowSnapshotRecordInput,
   ): Result<null, EvidenceIntegrityError>;

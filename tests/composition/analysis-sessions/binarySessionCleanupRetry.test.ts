@@ -1,6 +1,6 @@
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { expect, it, onTestFinished } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 
 import type { AnalysisClient } from "../../../src/application/AnalysisProvider.js";
 import { HopperStartError } from "../../../src/domain/hopperErrors.js";
@@ -156,6 +156,93 @@ it.each(["close", "switch", "open after close"] as const)(
     expect(new Set(fixture.runIds).size).toBe(fixture.created());
   },
 );
+
+it("settles a retained analysis client before admitting an external mutation", async () => {
+  const fixture = await retryFixture();
+  const [target] = fixture.targets;
+  expect((await fixture.session.open(target)).ok).toBe(true);
+  expect(await fixture.session.close()).toEqual(err(fixture.cleanupError));
+  const operation = vi.fn(async () => resultOk("provider finished"));
+  const mutate = () =>
+    fixture.session.withAdmittedExternalMutation(
+      target,
+      undefined,
+      operation,
+      (_value, failure) => failure,
+    );
+  expect(await mutate()).toEqual(err(fixture.cleanupError));
+  expect(operation).not.toHaveBeenCalled();
+  await access(fixture.runtime);
+  fixture.allowCleanup();
+  expect(await mutate()).toEqual(resultOk(resultOk("provider finished")));
+  expect(operation).toHaveBeenCalledOnce();
+  await expect(access(fixture.runtime)).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+  expect(await fixture.session.status()).toMatchObject({
+    cleanup_pending: false,
+  });
+  await fixture.session.close();
+});
+
+it("keeps recorded unknowns when a target switch cannot retire the previous provider", async () => {
+  const fixture = await retryFixture();
+  const [first, second] = fixture.targets;
+  expect((await fixture.session.open(first)).ok).toBe(true);
+  expect(
+    fixture.session.recordUnknown({
+      question: "Does this function reach the network?",
+      severity: "medium",
+      domain: "network",
+      supporting_evidence_ids: [],
+      contradicting_evidence_ids: [],
+      required_authority: "shipped-artifact",
+      required_confidence: "observed",
+      required_environment: null,
+      recommended_probes: [],
+      relationships: [],
+    }).ok,
+  ).toBe(true);
+
+  const switched = await fixture.session.open(second);
+
+  expect(switched.ok).toBe(false);
+  expect(fixture.session.listUnknowns({})).toHaveLength(1);
+});
+
+it("keeps a queued close behind an open that is still settling prior cleanup", async () => {
+  const fixture = await retryFixture();
+  const [first] = fixture.targets;
+  const release = createDeferred<void>();
+  const order: string[] = [];
+
+  const opening = fixture.session
+    .open(first, {
+      beforeOpen: async () => {
+        order.push("cleanup-start");
+        await release.promise;
+        order.push("cleanup-end");
+        return resultOk(null);
+      },
+    })
+    .then((result) => {
+      order.push("open");
+      return result;
+    });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const closing = fixture.session.close().then((result) => {
+    order.push("close");
+    return result;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(order).toEqual(["cleanup-start"]);
+
+  release.resolve();
+  await Promise.all([opening, closing]);
+
+  expect(order).toEqual(["cleanup-start", "cleanup-end", "open", "close"]);
+  expect(fixture.session.activeTarget()).toBeUndefined();
+});
 
 it("keeps a failed candidate for cleanup and preserves its startup failure", async () => {
   const primary = new HopperStartError();

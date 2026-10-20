@@ -72,6 +72,7 @@ export abstract class AnalysisError extends Error {
   readonly #cleanupPrimary: AnalysisError | undefined;
   // Undefined means unbound; a bound empty set records confirmed completion.
   #cleanupDependencies: Set<AnalysisError> | undefined;
+  #retainedOwnCleanupIncomplete: boolean | undefined;
   #cleanupResourceProjection:
     | { readonly cleanupResources: readonly string[] }
     | undefined;
@@ -124,11 +125,21 @@ export abstract class AnalysisError extends Error {
     const pending = [...this.#cleanupDependencies].filter(
       (dependency) => dependency.cleanupIncomplete,
     );
-    if (pending.length === 0) return [];
+    if (pending.length === 0)
+      return this.#retainedOwnCleanupIncomplete === true
+        ? (this.#cleanupResourceOwner?.cleanupResources ??
+            this.#ownedCleanupResources)
+        : [];
     if (this.#cleanupResourceProjection !== undefined)
       return this.#cleanupResourceProjection.cleanupResources;
     return [
-      ...new Set(pending.flatMap((dependency) => dependency.cleanupResources)),
+      ...new Set([
+        ...(this.#retainedOwnCleanupIncomplete === true
+          ? (this.#cleanupResourceOwner?.cleanupResources ??
+            this.#ownedCleanupResources)
+          : []),
+        ...pending.flatMap((dependency) => dependency.cleanupResources),
+      ]),
     ];
   }
 
@@ -155,17 +166,14 @@ export abstract class AnalysisError extends Error {
         diagnostics: structuredClone({ ...this.diagnostics, ...diagnostics }),
       });
     this.#secondaryFailures.push(failure);
+    this.#retainedOwnCleanupIncomplete ??= this.cleanupIncomplete;
+    if (failure.cleanupIncomplete) this.cleanupIncomplete = true;
+    this.#addCleanupDependencies([failure]);
     return this;
   }
 
-  /** Keep a composed error incomplete until all explicitly owned source errors resolve. */
-  bindCleanupDependencies(
-    dependencies: readonly AnalysisError[],
-    resourceProjection?: { readonly cleanupResources: readonly string[] },
-  ): this {
+  #addCleanupDependencies(dependencies: readonly AnalysisError[]): void {
     const pending = (this.#cleanupDependencies ??= new Set<AnalysisError>());
-    if (resourceProjection !== undefined)
-      this.#cleanupResourceProjection = resourceProjection;
     for (const dependency of dependencies) {
       if (!dependency.cleanupIncomplete || pending.has(dependency)) continue;
       pending.add(dependency);
@@ -176,24 +184,63 @@ export abstract class AnalysisError extends Error {
         new WeakRef(this),
       ];
     }
+  }
+
+  /** Keep a composed error incomplete until all explicitly owned source errors resolve. */
+  bindCleanupDependencies(
+    dependencies: readonly AnalysisError[],
+    resourceProjection?: { readonly cleanupResources: readonly string[] },
+  ): this {
+    const pending = (this.#cleanupDependencies ??= new Set<AnalysisError>());
+    if (resourceProjection !== undefined)
+      this.#cleanupResourceProjection = resourceProjection;
+    this.#addCleanupDependencies(dependencies);
     if (pending.size === 0) this.resolveCleanup();
+    else this.cleanupIncomplete = true;
     return this;
   }
 
   /** Clear live cleanup status only after its owning resource confirms retry success. */
   resolveCleanup(): this {
+    if (this.#retainedOwnCleanupIncomplete !== undefined)
+      this.#retainedOwnCleanupIncomplete = false;
     if (
       [...(this.#cleanupDependencies ?? [])].some(
         (dependency) => dependency.cleanupIncomplete,
       )
-    )
+    ) {
+      if (this.#retainedOwnCleanupIncomplete === false)
+        this.cleanupIncomplete = true;
       return this;
+    }
     this.#cleanupDependencies?.clear();
     this.cleanupIncomplete = false;
-    for (const reference of this.#cleanupDependents)
-      reference.deref()?.resolveCleanup();
+    for (const reference of this.#cleanupDependents) {
+      const dependent = reference.deref();
+      if (dependent !== undefined) dependent.#resolveCleanupFromDependency();
+    }
     this.#cleanupDependents = [];
     return this;
+  }
+
+  #resolveCleanupFromDependency(): void {
+    const dependenciesPending = [...(this.#cleanupDependencies ?? [])].some(
+      (dependency) => dependency.cleanupIncomplete,
+    );
+    if (this.#retainedOwnCleanupIncomplete !== undefined) {
+      this.cleanupIncomplete =
+        this.#retainedOwnCleanupIncomplete || dependenciesPending;
+      if (this.cleanupIncomplete) return;
+    } else if (dependenciesPending) {
+      return;
+    }
+    this.#cleanupDependencies?.clear();
+    this.cleanupIncomplete = false;
+    for (const reference of this.#cleanupDependents) {
+      const dependent = reference.deref();
+      if (dependent !== undefined) dependent.#resolveCleanupFromDependency();
+    }
+    this.#cleanupDependents = [];
   }
 
   /** Retain a completed observation when a later step fails. */

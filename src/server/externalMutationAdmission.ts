@@ -8,7 +8,8 @@ import { err, type Result } from "../domain/result.js";
 export type ExternalMutationAdmission = Pick<
   BinarySessionPort,
   "withAdmittedExternalMutation"
->;
+> &
+  Partial<Pick<BinarySessionPort, "retainExternalMutationOwner">>;
 
 /** Shared MCP admission and failure preservation for unrestricted commands. */
 export const runWithExternalMutationAdmission = async <Value>(

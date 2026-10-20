@@ -1542,6 +1542,30 @@ unknowns, malformed carriers and independent cleanup. An optional positional
 entrypoint verifies a fresh installed package. It acquires no engine, compiler
 or chain dependency and does not execute a contract on a chain.
 
+### Reverse-engineering providers
+
+`npm run verify:reverse-providers` is a separate Linux lane for the
+caller-supplied reverse-engineering providers. It accepts a provider list
+(`objdump`, `rizin`, `gdb`) and verifies all three when given no argument. It
+builds its own target with the host C compiler and drives the public CLI and MCP
+surfaces: every objdump operation, one caller-selected Rizin command, and a
+persistent GDB session that loads the target, sets a breakpoint, runs an
+inferior through a real terminal, reads a register, reports the bounded session
+status and closes the session.
+
+It asserts the observed provider versions, artifact identity before and after
+each call, the caller command and provider executable recorded in Evidence, the
+verified inferior-TTY readback, the one-shot command classifier that rejects
+`shell`, `!` and a trailing `&`, and that no owned debugger process survives the
+close. Every observation and an explicit unknown list are written to
+`reverse-providers-real.json`; the lane fails whenever an assertion cannot be
+established. Its disposable CI runner installs GDB and binutils, and the
+distribution's Rizin when the distribution provides one; otherwise the receipt
+records Rizin as unknown. Windows and macOS are not covered. The objdump
+`architectures` capability probe runs through the pathless
+`list-objdump-architectures` CLI command, because the one-shot
+`inspect-with-objdump` enumeration omits `architectures`.
+
 ### Recorded crash evidence
 
 `npm run verify:recorded:crash` is a separate Linux x64 lane. It requires GCC,

@@ -50,6 +50,8 @@ export interface OwnedProviderProcessSpawnOptions {
   readonly memoryLimitBytes?: number;
   /** Sweep exact run-token descendants during POSIX cleanup. */
   readonly sweepTokenOwnedProcesses?: boolean;
+  /** Notify the caller after ownership preflight and immediately before launch. */
+  readonly onDispatch?: () => void;
   /** Cancels native ownership preparation before provider process creation. */
   readonly signal?: AbortSignal;
 }
@@ -207,6 +209,11 @@ export interface ProviderProcessStopOptions {
   readonly cleanupResult?: ProcessCleanupResult;
   readonly terminationGraceMs?: number;
   readonly killGraceMs?: number;
+  /**
+   * Bounded wait for output streams to close after verified cleanup, before
+   * capture listeners are detached, so late diagnostics are still collected.
+   */
+  readonly outputSettleMs?: number;
 }
 
 /** Exact disposition of one owned process stop attempt. */
@@ -238,14 +245,23 @@ export const spawnOwnedProviderProcess = async (
   await prepareProcessOwnershipInspection(options.signal);
   options.signal?.throwIfAborted();
   const platform = options.platform ?? process.platform;
-  const sweepTokenOwnedProcesses =
+  // A requested sweep is part of the cleanup contract, never an optional
+  // optimization. Hosts without identity baselines must refuse before launch.
+  const requiresTokenSweep =
     options.sweepTokenOwnedProcesses === true && platform !== "win32";
+  const captureOwnershipBaseline = requiresTokenSweep
+    ? systemProcessOwnershipHost.captureBaseline
+    : undefined;
+  if (requiresTokenSweep && captureOwnershipBaseline === undefined)
+    throw Object.assign(
+      new Error(
+        "Token-owned process cleanup requires a host ownership baseline; use a supported Linux or macOS host (or Windows Job Objects).",
+      ),
+      { code: "ERR_PROCESS_OWNERSHIP_UNAVAILABLE" },
+    );
   let captureBaseline: ProcessOwnershipBaseline | undefined;
-  if (sweepTokenOwnedProcesses) {
-    const capture = systemProcessOwnershipHost.captureBaseline;
-    if (capture === undefined)
-      throw new Error("Process ownership baseline is unavailable on this host");
-    captureBaseline = await capture(options.signal);
+  if (captureOwnershipBaseline !== undefined) {
+    captureBaseline = await captureOwnershipBaseline(options.signal);
     options.signal?.throwIfAborted();
   }
   const hostEnvironment = options.hostEnvironment ?? process.env;
@@ -255,6 +271,7 @@ export const spawnOwnedProviderProcess = async (
     REA_PROCESS_RUN_ID: options.runId,
   };
   if (platform === "win32" && process.platform === "win32") {
+    options.onDispatch?.();
     const child = new WindowsOwnedProcess(
       options.command,
       options.arguments,
@@ -283,6 +300,7 @@ export const spawnOwnedProviderProcess = async (
     throw new Error(
       "Owned process memory limits require the Windows Job Object launcher; no limit can be enforced on this host.",
     );
+  options.onDispatch?.();
   const child = spawn(options.command, [...options.arguments], {
     shell: false,
     windowsHide: true,
@@ -301,7 +319,7 @@ export const spawnOwnedProviderProcess = async (
     processGroupId: pid,
     expectedParentPid: process.pid,
     evidenceOwner: new ProcessOwnershipEvidenceOwner(),
-    ...(sweepTokenOwnedProcesses
+    ...(requiresTokenSweep
       ? {
           sweepTokenOwnedProcesses: true,
           captureBaseline: captureBaseline!,
@@ -663,6 +681,10 @@ export class ProviderProcessSupervisor {
         }
       }
       if (!completed) this.unref();
+      else if (options.outputSettleMs !== undefined)
+        await this.waitForOutputClose(options.outputSettleMs).catch(
+          () => undefined,
+        );
       return result;
     } finally {
       if (completed) this.dispose();
@@ -815,8 +837,15 @@ export class ProviderProcessSupervisor {
   }
 }
 
+const OUTPUT_CAPTURE_CHUNK_BYTES = 4 * 1024;
+
+interface ProcessOutputChunk {
+  readonly buffer: Buffer;
+  used: number;
+}
+
 class ProcessOutputCapture {
-  readonly #chunks: Buffer[] = [];
+  readonly #chunks: ProcessOutputChunk[] = [];
   #bytes = 0;
 
   get bytes(): number {
@@ -830,12 +859,32 @@ class ProcessOutputCapture {
 
   append(chunk: Buffer): void {
     this.#bytes += chunk.byteLength;
-    this.#chunks.push(Buffer.from(chunk));
+    let sourceOffset = 0;
+    while (sourceOffset < chunk.byteLength) {
+      let tail = this.#chunks.at(-1);
+      if (tail === undefined || tail.used === tail.buffer.byteLength) {
+        tail = {
+          buffer: Buffer.allocUnsafe(OUTPUT_CAPTURE_CHUNK_BYTES),
+          used: 0,
+        };
+        this.#chunks.push(tail);
+      }
+      const copied = Math.min(
+        chunk.byteLength - sourceOffset,
+        tail.buffer.byteLength - tail.used,
+      );
+      chunk.copy(tail.buffer, tail.used, sourceOffset, sourceOffset + copied);
+      tail.used += copied;
+      sourceOffset += copied;
+    }
   }
 
   snapshot(observedBytes: number): ProviderProcessSnapshot["stdout"] {
     return this.#snapshotBuffer(
-      Buffer.concat(this.#chunks, this.#bytes),
+      Buffer.concat(
+        this.#chunks.map(({ buffer, used }) => buffer.subarray(0, used)),
+        this.#bytes,
+      ),
       observedBytes,
     );
   }
@@ -849,10 +898,11 @@ class ProcessOutputCapture {
     const chunks: Buffer[] = [];
     let offset = 0;
     for (const chunk of this.#chunks) {
-      const chunkEnd = offset + chunk.byteLength;
+      const chunkEnd = offset + chunk.used;
       const from = Math.max(availableStart, offset);
       const to = Math.min(availableEnd, chunkEnd);
-      if (to > from) chunks.push(chunk.subarray(from - offset, to - offset));
+      if (to > from)
+        chunks.push(chunk.buffer.subarray(from - offset, to - offset));
       offset = chunkEnd;
       if (offset >= availableEnd) break;
     }
