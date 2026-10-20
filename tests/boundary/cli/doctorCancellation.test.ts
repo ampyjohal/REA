@@ -97,16 +97,19 @@ setTimeout(() => process.exit(99), 20000);
       const observed = z
         .strictObject({
           pid: z.number().int().positive(),
-          runId: z.string().uuid().optional(),
+          // The Kuna direct-exec probe is not part of an owned process group,
+          // so its inherited run ID is intentionally irrelevant here.
+          runId: z.string().optional(),
         })
         .parse(JSON.parse(await readFile(ready, "utf8")));
       if (provider === "jadx") {
         if (observed.runId === undefined)
           throw new Error("Missing JADX run token");
+        const runId = z.string().uuid().parse(observed.runId);
         ownership = {
           leaderPid: observed.pid,
           processGroupId: observed.pid,
-          runId: observed.runId,
+          runId,
         };
       }
       child.kill(signal);

@@ -66,9 +66,12 @@ export class WindowsOwnedProcess extends EventEmitter {
   #settle: (() => void) | undefined;
   #closed = false;
   #failure: string | undefined;
+  #consecutivePollFailures = 0;
   #timer: NodeJS.Timeout | undefined;
+  #shutdownRequested = false;
   #blockedWake: NodeJS.Timeout | undefined;
   readonly #blockedOutput = new Set<PassThrough>();
+  #discardingOutput = false;
   #unreferenced = false;
   #cleanup: Promise<ProcessCleanupResult> | undefined;
   readonly #memoryLimitBytes: number | undefined;
@@ -215,11 +218,14 @@ export class WindowsOwnedProcess extends EventEmitter {
           .number()
           .parse(this.#authority.call("process_alive", [this.#handle])) > 0
       );
-    return this.#closed
-      ? false
-      : z
-          .boolean()
-          .parse(this.#authority.call("process_terminate", [this.#handle]));
+    if (this.#closed) return false;
+    const signaled = z
+      .boolean()
+      .parse(this.#authority.call("process_terminate", [this.#handle]));
+    // Only an explicit termination decision may release the owner-exit guard.
+    // A failed observation alone must never close a kill-on-owner-close job.
+    this.#shutdownRequested = true;
+    return signaled;
   }
 
   /** Terminate and verify that the entire job has settled before releasing it. */
@@ -250,6 +256,16 @@ export class WindowsOwnedProcess extends EventEmitter {
     let timer: NodeJS.Timeout | undefined;
     try {
       const signaled = this.kill();
+      this.#consecutivePollFailures = 0;
+      // A recovery backoff may be seconds away; explicit cleanup resumes
+      // prompt polling so buffered output cannot outlive the deadline.
+      if (this.#timer !== undefined) {
+        clearTimeout(this.#timer);
+        this.#timer = undefined;
+      }
+      // From here on, output that would block a consumer is discarded so the
+      // job's closed pipes stay observable until cleanup settles.
+      this.#discardingOutput = true;
       this.#discardBlockedOutput();
       this.#schedule();
       const settled = await Promise.race([
@@ -284,7 +300,7 @@ export class WindowsOwnedProcess extends EventEmitter {
     )
       return;
     this.#timer = setTimeout(() => this.#poll(), delay);
-    if (this.#unreferenced) this.#timer.unref();
+    if (this.#shutdownRequested || this.#unreferenced) this.#timer.unref();
   }
 
   #scheduleBlockedWake(): void {
@@ -338,6 +354,7 @@ export class WindowsOwnedProcess extends EventEmitter {
         state = limited;
       }
       this.#failure = undefined;
+      this.#consecutivePollFailures = 0;
       // Stop native reads while either consumer is backpressured. A slower
       // cadence still accumulates unbounded unread output in the parent heap.
       const idle = state.stdout.length === 0 && state.stderr.length === 0;
@@ -357,11 +374,22 @@ export class WindowsOwnedProcess extends EventEmitter {
       } else this.#schedule(idle ? 25 : 0);
     } catch (cause: unknown) {
       const failure = cause instanceof Error ? cause : new Error(String(cause));
+      // Native polling is not atomic: it may drain one stream before a later
+      // read (stderr or job state) fails. Retrying cannot recover those bytes.
+      this.#outputIncomplete = true;
       this.#failure = failure.message;
       // Native lifecycle failures belong to the error/cleanup channels, never
       // the captured stderr observation produced by the child itself.
       if (this.listenerCount("error") > 0) this.emit("error", failure);
-      // Retain the original job so explicit cleanup can retry its observation.
+      // Observation never terminates the job. Back off to a low-frequency
+      // referenced retry so naturally exiting descendants can still settle.
+      this.#consecutivePollFailures = Math.min(
+        this.#consecutivePollFailures + 1,
+        6,
+      );
+      this.#schedule(
+        Math.min(5_000, 250 * 2 ** (this.#consecutivePollFailures - 1)),
+      );
     }
   }
 
@@ -372,6 +400,11 @@ export class WindowsOwnedProcess extends EventEmitter {
       return;
     }
     if (stream.write(bytes)) return;
+    if (this.#discardingOutput) {
+      this.#outputIncomplete = true;
+      stream.destroy();
+      return;
+    }
     this.#blockedOutput.add(stream);
     const unblock = () => {
       stream.off("drain", unblock);

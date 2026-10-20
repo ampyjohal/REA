@@ -212,6 +212,10 @@ it("preserves cancellation when staging cleanup also fails", async () => {
     // directory is reported as cleanup state, not as the cancellation cause.
     expect(result.error.cause).toBe(controller.signal.reason);
     expect(result.error.cleanupPrimary).toBeInstanceOf(AnalysisCancelledError);
+    expect(result.error.cleanup).toMatchObject({
+      reason: expect.stringContaining("Unexpected staging entries"),
+      resources: [expect.stringContaining(".rea-write-")],
+    });
     expect(result.error.cleanupResources).toEqual([
       expect.stringContaining(".rea-write-"),
     ]);
@@ -219,6 +223,8 @@ it("preserves cancellation when staging cleanup also fails", async () => {
     const stage = requireStages(root)[0];
     if (stage !== undefined) await fs.rm(join(root, stage, "unexpected"));
   } finally {
+    for (const stage of requireStages(root))
+      await fs.rm(join(root, stage, "unexpected"), { force: true });
     await resources.close();
     await rm(root, { recursive: true, force: true });
   }

@@ -75,13 +75,14 @@ afterEach(async () => {
     ownedPid > 0
   ) {
     try {
-      const commandLine = await readFile(`/proc/${ownedPid}/cmdline`, "utf8");
-      if (testDirectory !== undefined && commandLine.includes(testDirectory))
-        process.kill(ownedPid, "SIGKILL");
+      if (testDirectory !== undefined)
+        await writeFile(join(testDirectory, "target.stop"), "stop\n");
     } catch {
-      // The test target may already have exited.
+      // The temporary directory or test target may already be gone.
     }
   }
+  if (ownedPid !== undefined && Number.isSafeInteger(ownedPid) && ownedPid > 0)
+    await waitForFakeInferiorExit(ownedPid);
   inferiorPid = undefined;
   if (testDirectory !== undefined)
     await rm(testDirectory, { recursive: true, force: true });
@@ -183,7 +184,7 @@ it.skipIf(process.platform !== "linux").each([
   {
     name: "multiple ptrace rows",
     response:
-      '[{"raised":true,"fd":3,"uri":"ptrace://1"},{"raised":true,"fd":4,"uri":"ptrace://2"}]',
+      '[{"raised":true,"fd":3,"uri":"ptrace://999999998"},{"raised":true,"fd":4,"uri":"ptrace://999999999"}]',
     closeSucceeds: false,
   },
 ])(
@@ -440,10 +441,11 @@ it.skipIf(
     const wrapper = join(testDirectory, "rizin-with-long-lived-inferior.sh");
     const pidPath = join(testDirectory, "target.pid");
     const releasePath = join(testDirectory, "emit-output");
+    const stopPath = join(testDirectory, "target.stop");
     const target = join(testDirectory, "target.py");
     await writeFile(
       target,
-      `import os, sys, time\nopen(${JSON.stringify(pidPath)}, "w").write(str(os.getpid()))\nwhile not os.path.exists(${JSON.stringify(releasePath)}): time.sleep(0.02)\nprint("REA_RIZIN_STDOUT_MARKER", flush=True)\nprint("REA_RIZIN_STDERR_MARKER", file=sys.stderr, flush=True)\ntime.sleep(60)\n`,
+      `import os, sys, time\nopen(${JSON.stringify(pidPath)}, "w").write(str(os.getpid()))\nwhile not os.path.exists(${JSON.stringify(releasePath)}) and not os.path.exists(${JSON.stringify(stopPath)}): time.sleep(0.02)\nif os.path.exists(${JSON.stringify(stopPath)}): sys.exit(0)\nprint("REA_RIZIN_STDOUT_MARKER", flush=True)\nprint("REA_RIZIN_STDERR_MARKER", file=sys.stderr, flush=True)\nwhile not os.path.exists(${JSON.stringify(stopPath)}): time.sleep(0.02)\n`,
     );
     await writeFile(
       wrapper,
@@ -530,7 +532,10 @@ async function startFakeInferiorSession(
   const pidPath = join(testDirectory, "target.pid");
   const provider = join(testDirectory, "fake-rizin.cjs");
   const launchTarget = options.launchTarget ?? true;
-  await writeFile(targetPath, "setInterval(() => {}, 1000);\n");
+  await writeFile(
+    targetPath,
+    `import fs from "node:fs";\nconst stopPath = ${JSON.stringify(join(testDirectory, "target.stop"))};\nconst timer = setInterval(() => { try { fs.accessSync(stopPath); clearInterval(timer); process.exit(0); } catch {} }, 10);\n`,
+  );
   const initialRows = options.initialRows ?? null;
   const afterDetach = options.afterDetach ?? (() => "[]");
   const stderrPath = options.stderrPath ?? tty;
@@ -635,6 +640,36 @@ async function expectCloseRejectedAndReleased(
 ): Promise<void> {
   expect((await manager!.close(sessionId)).ok).toBe(false);
   expect(manager!.status(sessionId)?.state).toBe("closed");
+  if (inferiorPid !== undefined) {
+    expect(() => process.kill(inferiorPid!, 0)).not.toThrow();
+    await expect(manager!.closeAll()).rejects.toThrow();
+    await stopFakeInferior();
+  }
   await manager!.closeAll();
   expect(manager!.status(sessionId)).toBeUndefined();
+}
+
+async function stopFakeInferior(): Promise<void> {
+  if (inferiorPid === undefined || testDirectory === undefined) return;
+  const pid = inferiorPid;
+  try {
+    await writeFile(join(testDirectory, "target.stop"), "stop\n");
+  } catch {
+    // The temporary directory or test-owned inferior may already be gone.
+  }
+  await waitForFakeInferiorExit(pid);
+  inferiorPid = undefined;
+}
+
+async function waitForFakeInferiorExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try {
+      await readFile(`/proc/${pid}/stat`, "utf8");
+    } catch {
+      return;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
+  throw new Error("The test-owned Rizin inferior did not exit cooperatively.");
 }

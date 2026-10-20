@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { isUtf8 } from "node:buffer";
-import { open, readlink, realpath, stat } from "node:fs/promises";
+import {
+  open,
+  readFile,
+  readlink,
+  readdir,
+  realpath,
+  stat,
+} from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { isatty } from "node:tty";
 
@@ -17,6 +24,10 @@ import type {
 } from "../domain/analysisErrorBase.js";
 import { createEvidence, type Evidence } from "../domain/evidence.js";
 import { err, ok, type Result } from "../domain/result.js";
+import {
+  verifyInferiorInputSink,
+  type InferiorInputSink,
+} from "../process/inferiorInputSink.js";
 import {
   ProviderProcessSupervisor,
   spawnOwnedProviderProcess,
@@ -180,6 +191,15 @@ interface RizinDebugSession {
   readonly inferiorTtyDevice: number;
   readonly inferiorTtyInode: number;
   readonly knownInferiorIdentities: Map<string, OwnedInferiorIdentity>;
+  confirmedDetachedInferiorIdentity: OwnedInferiorIdentity | undefined;
+  completedDetachCommand:
+    | {
+        readonly fd: string;
+        readonly identity: OwnedInferiorIdentity;
+        readonly readbackDisproved?: true;
+      }
+    | undefined;
+  verifiedDetachResult: OwnedDebuggerDetachResult | undefined;
   inferiorInventoryComplete: boolean;
   inferiorStateUnknown: () => boolean;
   verifyInferiorsEndedAfterExit: () => Promise<boolean>;
@@ -237,6 +257,12 @@ export class RizinDebugSessionManager {
   readonly #platform: NodeJS.Platform;
   readonly #stopProcess: typeof stopOwnedDebuggerProcess;
   readonly #spawnProcess: typeof spawnOwnedProviderProcess;
+  readonly #readProcessStartTime: (pid: string) => Promise<string | null>;
+  readonly #readProcessTracerPid: (pid: string) => Promise<number>;
+  readonly #readProcessTaskIds: (pid: string) => Promise<ReadonlySet<string>>;
+  readonly #onInferiorDetachVerified:
+    | ((result: OwnedDebuggerDetachResult) => void)
+    | undefined;
 
   constructor(
     environment: Readonly<NodeJS.ProcessEnv> = process.env,
@@ -249,6 +275,17 @@ export class RizinDebugSessionManager {
       readonly platform?: NodeJS.Platform;
       readonly stopProcess?: typeof stopOwnedDebuggerProcess;
       readonly spawnProcess?: typeof spawnOwnedProviderProcess;
+      /** @internal Test seam for deterministic Linux process identity checks. */
+      readonly readProcessStartTime?: (pid: string) => Promise<string | null>;
+      /** @internal Test seams for identifying the tracer of a reused inferior PID. */
+      readonly readProcessTracerPid?: (pid: string) => Promise<number>;
+      readonly readProcessTaskIds?: (
+        pid: string,
+      ) => Promise<ReadonlySet<string>>;
+      /** @internal Test seam called after all detach checks have completed. */
+      readonly onInferiorDetachVerified?: (
+        result: OwnedDebuggerDetachResult,
+      ) => void;
     } = {},
   ) {
     this.#environment = { ...environment };
@@ -260,6 +297,13 @@ export class RizinDebugSessionManager {
     this.#platform = options.platform ?? process.platform;
     this.#stopProcess = options.stopProcess ?? stopOwnedDebuggerProcess;
     this.#spawnProcess = options.spawnProcess ?? spawnOwnedProviderProcess;
+    this.#readProcessStartTime =
+      options.readProcessStartTime ?? readLinuxProcessStartTime;
+    this.#readProcessTracerPid =
+      options.readProcessTracerPid ?? readLinuxProcessTracerPid;
+    this.#readProcessTaskIds =
+      options.readProcessTaskIds ?? readLinuxProcessTaskIds;
+    this.#onInferiorDetachVerified = options.onInferiorDetachVerified;
   }
 
   async start(
@@ -372,9 +416,19 @@ export class RizinDebugSessionManager {
       "-0",
       "-d",
       "-R",
+      `stdin=${ttyPath}`,
+      "-R",
       `stdout=${ttyPath}`,
       "-R",
       `stderr=${ttyPath}`,
+      // The debugger carries REA's ownership token; the inferior must see the
+      // caller's value (or none) so a later sweep cannot mistake it for an
+      // owned process.
+      "-R",
+      Object.hasOwn(this.#environment, "REA_PROCESS_RUN_ID") &&
+      this.#environment.REA_PROCESS_RUN_ID !== undefined
+        ? `setenv=REA_PROCESS_RUN_ID=${this.#environment.REA_PROCESS_RUN_ID}`
+        : "unsetenv=REA_PROCESS_RUN_ID",
       "-e",
       "dbg.exitkills=false",
       ...(input.backend === undefined ? [] : ["-D", input.backend]),
@@ -414,20 +468,32 @@ export class RizinDebugSessionManager {
       inferiorTtyDevice: ttyDevice,
       inferiorTtyInode: ttyInode,
       knownInferiorIdentities: new Map(),
+      confirmedDetachedInferiorIdentity: undefined,
+      completedDetachCommand: undefined,
+      verifiedDetachResult: undefined,
       inferiorInventoryComplete: false,
       inferiorStateUnknown: () => !session.inferiorInventoryComplete,
       verifyInferiorsEndedAfterExit: async () => {
         if (!session.inferiorInventoryComplete) return false;
         const ended = await verifyOwnedInferiorsEnded(
           session.knownInferiorIdentities.values(),
+          this.#readProcessStartTime,
         );
         if (ended) session.knownInferiorIdentities.clear();
         return ended;
       },
-      detachInferior: () =>
-        session.cleanupCommandTurnHeld
+      detachInferior: () => {
+        if (session.verifiedDetachResult !== undefined)
+          return Promise.resolve(session.verifiedDetachResult);
+        const attempt = session.cleanupCommandTurnHeld
           ? this.#detachInferiorUnlocked(session)
-          : this.#detachInferior(session),
+          : this.#detachInferior(session);
+        return attempt.then((result) => {
+          session.verifiedDetachResult = result;
+          this.#onInferiorDetachVerified?.(result);
+          return result;
+        });
+      },
       cleanupCommandTurnHeld: false,
       stopAttempt: undefined,
       cleanupFailures: new Set(),
@@ -1153,73 +1219,359 @@ export class RizinDebugSessionManager {
   async #detachInferiorUnlocked(
     session: RizinDebugSession,
   ): Promise<OwnedDebuggerDetachResult> {
+    const previouslyConfirmedDetach = session.confirmedDetachedInferiorIdentity;
     if (session.exited || session.protocolError !== undefined)
       throw new Error(
         "Rizin protocol state is ambiguous; inferior detach is unverified.",
       );
+    if (session.completedDetachCommand !== undefined)
+      return this.#verifyCompletedDetachCommand(
+        session,
+        session.completedDetachCommand,
+      );
+    if (session.confirmedDetachedInferiorIdentity !== undefined)
+      return this.#verifyConfirmedDetachedInferior(
+        session,
+        session.confirmedDetachedInferiorIdentity,
+      );
     session.inferiorInventoryComplete = false;
-    session.knownInferiorIdentities.clear();
     const inferior = parseRizinPtraceRows(
       await this.#runInternalCommand(session, "olj"),
     );
     if (inferior.length === 0) {
-      session.knownInferiorIdentities.clear();
+      await assertRizinEmptyInferiorInventory(
+        session.knownInferiorIdentities.values(),
+        this.#readProcessStartTime,
+      );
+      // Keep prior identities until the debugger itself is fully stopped.
+      // A later cleanup retry may receive a stale ptrace row after this valid
+      // empty inventory; retaining the proof lets us recognize that exact PID.
       session.inferiorInventoryComplete = true;
       return { status: "no-inferior" };
     }
-    session.knownInferiorIdentities.clear();
-    for (const [, pid] of inferior) {
-      if (session.knownInferiorIdentities.has(pid)) continue;
-      const startTime = await readLinuxProcessStartTime(pid);
-      if (startTime === null)
+    const currentIdentities = new Map<string, OwnedInferiorIdentity>();
+    const activeInferiors: Array<[string, string]> = [];
+    for (const [fd, pid] of inferior) {
+      const identity = await this.#resolveInferiorRowIdentity(session, pid);
+      if (identity === undefined) continue;
+      // Retain each owned identity as soon as it is observed. A later row or
+      // partial-inventory check can fail, and a retry must still account for
+      // every target already reported by Rizin.
+      currentIdentities.set(pid, identity);
+      session.knownInferiorIdentities.set(pid, identity);
+      activeInferiors.push([fd, pid]);
+    }
+    for (const [pid, identity] of session.knownInferiorIdentities) {
+      if (currentIdentities.has(pid)) continue;
+      if (
+        previouslyConfirmedDetach?.pid === pid &&
+        previouslyConfirmedDetach.startTime === identity.startTime
+      )
+        continue;
+      // A non-empty but partial ptrace inventory does not prove that an
+      // omitted retained target was detached. Only its end or a changed PID
+      // identity makes it safe to proceed toward stopping the debugger.
+      if (
+        !(await verifyOwnedInferiorsEnded(
+          [identity],
+          this.#readProcessStartTime,
+        ))
+      )
         throw new Error(
-          `Inferior PID ${pid} ended before its identity could be established.`,
+          `Rizin omitted retained inferior PID ${pid} from the ptrace inventory while it is still active.`,
         );
-      session.knownInferiorIdentities.set(pid, {
-        pid,
-        startTime,
-      });
     }
     session.inferiorInventoryComplete = true;
-    if (inferior.length !== 1)
+    if (activeInferiors.length === 0) {
+      // Keep previously proven identities until the debugger is fully stopped.
+      // A stop timeout can leave this stale ptrace row for another cleanup retry.
+      return { status: "no-inferior" };
+    }
+    if (activeInferiors.length !== 1)
       throw new Error("Rizin reported multiple or ambiguous ptrace inferiors.");
-    const [fd, pid] = inferior[0]!;
+    const [fd, pid] = activeInferiors[0]!;
     const identity = session.knownInferiorIdentities.get(pid)!;
     assertRizinProcessStartTimeStable(
       identity.startTime,
-      await readLinuxProcessStartTime(pid),
+      await this.#readProcessStartTime(pid),
     );
     await this.#verifyDebuggerExitPolicy(session);
     await this.#verifyInferiorOutputDescriptors(session, pid);
     await this.#runInternalCommand(session, `o- ${fd}`);
+    // The command completion marker is durable protocol state. If its readback
+    // is malformed, retain the exact identity and reconcile it on retry rather
+    // than treating an empty inventory as proof that a live target vanished.
+    session.completedDetachCommand = { fd, identity };
+    return this.#verifyCompletedDetachCommand(
+      session,
+      session.completedDetachCommand,
+    );
+  }
+
+  async #verifyCompletedDetachCommand(
+    session: RizinDebugSession,
+    completed: {
+      readonly fd: string;
+      readonly identity: OwnedInferiorIdentity;
+      readonly readbackDisproved?: true;
+    },
+  ): Promise<OwnedDebuggerDetachResult> {
     const after = parseRizinPtraceRows(
       await this.#runInternalCommand(session, "olj"),
     );
-    if (
-      after.some(
-        ([activeFd, activePid]) => activeFd === fd || activePid === pid,
-      ) ||
-      after.length !== 0
-    )
+    const selectedRow = after.find(
+      ([activeFd, activePid]) =>
+        activeFd === completed.fd || activePid === completed.identity.pid,
+    );
+    if (selectedRow !== undefined) {
+      const [activeFd, activePid] = selectedRow;
+      if (activeFd === completed.fd && activePid === completed.identity.pid) {
+        const activeIdentity = await this.#resolveInferiorRowIdentity(
+          session,
+          activePid,
+        );
+        if (activeIdentity === undefined) {
+          // A verified stale row no longer represents the completed target.
+          // Drop only the command receipt. The retained detach confirmation is
+          // checked against a complete inventory before its fast path succeeds.
+          session.completedDetachCommand = undefined;
+        } else {
+          // A definitive live inventory disproves this detach attempt. Recheck
+          // ownership and issue a fresh detach command on retry. Malformed or
+          // ambiguous rows keep the completed proof above.
+          session.completedDetachCommand = undefined;
+          session.confirmedDetachedInferiorIdentity = undefined;
+          session.inferiorInventoryComplete = false;
+          throw new Error(
+            "Rizin still reports the selected inferior after the detach command completed.",
+          );
+        }
+      } else {
+        // A reused FD or PID cannot confirm which inferior survived `o-`.
+        // Retain that contradiction so a later empty inventory cannot turn it
+        // into detach proof while the originally selected process is alive.
+        session.completedDetachCommand = {
+          ...completed,
+          readbackDisproved: true,
+        };
+      }
       throw new Error(
         "Rizin did not confirm that the selected inferior FD was detached.",
       );
+    }
+    if (completed.readbackDisproved === true) {
+      for (const [, activePid] of after) {
+        if (
+          (await this.#resolveInferiorRowIdentity(session, activePid)) !==
+          undefined
+        )
+          throw new Error(
+            "Rizin reported another active inferior after an ambiguous detach readback.",
+          );
+      }
+      for (const [pid, identity] of session.knownInferiorIdentities) {
+        if (pid === completed.identity.pid) continue;
+        if (
+          !(await verifyOwnedInferiorsEnded(
+            [identity],
+            this.#readProcessStartTime,
+          ))
+        )
+          throw new Error(
+            `Rizin omitted retained inferior PID ${pid} from the ambiguous detach inventory while it is still active.`,
+          );
+      }
+      if (
+        !(await verifyOwnedInferiorsEnded(
+          [completed.identity],
+          this.#readProcessStartTime,
+        ))
+      )
+        throw new Error(
+          "Rizin did not confirm that the selected inferior was detached after an ambiguous readback.",
+        );
+      session.completedDetachCommand = undefined;
+      session.confirmedDetachedInferiorIdentity = undefined;
+      session.inferiorInventoryComplete = false;
+      return { status: "no-inferior" };
+    }
+    // The selected FD's absence is useful durable proof even when another
+    // active inferior makes it unsafe to stop the debugger. Retain both facts:
+    // its detach confirmation and the completed command awaiting clean inventory.
+    session.confirmedDetachedInferiorIdentity = completed.identity;
+    for (const [, activePid] of after) {
+      // Rizin can retain an unrelated ptrace row after its original process
+      // ended. Reuse the same identity/tracer reconciliation as the initial
+      // inventory; any row that still names an active inferior remains fatal.
+      let activeIdentity: OwnedInferiorIdentity | undefined;
+      try {
+        activeIdentity = await this.#resolveInferiorRowIdentity(
+          session,
+          activePid,
+        );
+      } catch (cause) {
+        session.completedDetachCommand = {
+          ...completed,
+          readbackDisproved: true,
+        };
+        throw cause;
+      }
+      if (activeIdentity !== undefined)
+        throw new Error(
+          "Rizin reported another active inferior after detaching the selected FD.",
+        );
+    }
+    for (const [pid, identity] of session.knownInferiorIdentities) {
+      if (pid === completed.identity.pid) continue;
+      if (
+        !(await verifyOwnedInferiorsEnded(
+          [identity],
+          this.#readProcessStartTime,
+        ))
+      )
+        throw new Error(
+          `Rizin omitted retained inferior PID ${pid} from the post-detach inventory while it is still active.`,
+        );
+    }
+    // Preserve this protocol proof before later identity and descriptor checks.
+    // A retry can then revalidate the retained process sinks without issuing
+    // another detach command or treating an empty inventory as contradictory.
+    session.completedDetachCommand = undefined;
+    session.inferiorInventoryComplete = true;
+    session.confirmedDetachedInferiorIdentity = completed.identity;
+    return this.#verifyConfirmedDetachedInferior(session, completed.identity);
+  }
+
+  async #resolveInferiorRowIdentity(
+    session: RizinDebugSession,
+    pid: string,
+  ): Promise<OwnedInferiorIdentity | undefined> {
+    const previous = session.knownInferiorIdentities.get(pid);
+    const startTime = await this.#readProcessStartTime(pid);
+    if (startTime === null) {
+      if (previous === undefined)
+        throw new Error(
+          `Inferior PID ${pid} ended before its identity could be established.`,
+        );
+      // A transient ENOENT can race with PID reuse. Confirm the second lookup
+      // directly so a new identity still goes through tracer ownership checks.
+      const confirmedStartTime = await this.#readProcessStartTime(pid);
+      if (confirmedStartTime === null) return undefined;
+      if (
+        previous.startTime !== confirmedStartTime &&
+        !(await this.#replacementIsTracedByOwnedDebugger(
+          session,
+          pid,
+          confirmedStartTime,
+        ))
+      ) {
+        await this.#verifyDebuggerExitPolicy(session);
+        return undefined;
+      }
+      const identity = { pid, startTime: confirmedStartTime };
+      session.knownInferiorIdentities.set(pid, identity);
+      return identity;
+    }
+    if (
+      previous !== undefined &&
+      previous.startTime !== startTime &&
+      !(await this.#replacementIsTracedByOwnedDebugger(session, pid, startTime))
+    ) {
+      // Rizin may keep a ptrace IO row after the old PID exits. Linux's
+      // TracerPid identifies whether that row could still affect a replacement;
+      // only a fresh debugger policy readback makes a stale row ignorable.
+      await this.#verifyDebuggerExitPolicy(session);
+      return undefined;
+    }
+    const identity = { pid, startTime };
+    const confirmedDetach = session.confirmedDetachedInferiorIdentity;
+    if (
+      confirmedDetach?.pid === pid &&
+      confirmedDetach.startTime === startTime &&
+      !(await this.#replacementIsTracedByOwnedDebugger(session, pid, startTime))
+    ) {
+      // A stale ptrace row can survive detach while the same process remains
+      // alive. Confirm it is no longer traced before ignoring the row.
+      await this.#verifyDebuggerExitPolicy(session);
+      return undefined;
+    }
+    session.knownInferiorIdentities.set(pid, identity);
+    return identity;
+  }
+
+  async #verifyConfirmedDetachedInferior(
+    session: RizinDebugSession,
+    identity: OwnedInferiorIdentity,
+  ): Promise<OwnedDebuggerDetachResult> {
+    const activeIdentities = new Map<string, OwnedInferiorIdentity>();
+    for (const [, pid] of parseRizinPtraceRows(
+      await this.#runInternalCommand(session, "olj"),
+    )) {
+      const activeIdentity = await this.#resolveInferiorRowIdentity(
+        session,
+        pid,
+      );
+      if (activeIdentity === undefined) continue;
+      if (
+        activeIdentity.pid === identity.pid &&
+        activeIdentity.startTime === identity.startTime
+      ) {
+        session.confirmedDetachedInferiorIdentity = undefined;
+        session.inferiorInventoryComplete = false;
+        throw new Error(
+          "Rizin still reports the confirmed detached inferior as active.",
+        );
+      }
+      activeIdentities.set(pid, activeIdentity);
+    }
+    for (const [pid, knownIdentity] of session.knownInferiorIdentities) {
+      if (
+        pid === identity.pid &&
+        knownIdentity.startTime === identity.startTime
+      )
+        continue;
+      if (activeIdentities.has(pid))
+        throw new Error(
+          "Rizin reported another active inferior while reconciling a completed detach.",
+        );
+      if (
+        !(await verifyOwnedInferiorsEnded(
+          [knownIdentity],
+          this.#readProcessStartTime,
+        ))
+      )
+        throw new Error(
+          `Rizin omitted retained inferior PID ${pid} from the detach inventory while it is still active.`,
+        );
+    }
+    session.inferiorInventoryComplete = true;
     // Protocol readback must never be waived by proof that a process ended.
     await this.#verifyDebuggerExitPolicy(session);
+    let inputSink: InferiorInputSink;
     try {
       assertRizinProcessStartTimeStable(
         identity.startTime,
-        await readLinuxProcessStartTime(pid),
+        await this.#readProcessStartTime(identity.pid),
       );
-      await this.#verifyInferiorOutputDescriptors(session, pid);
+      inputSink = await this.#verifyInferiorOutputDescriptors(
+        session,
+        identity.pid,
+      );
     } catch (cause) {
       // Detach resumes the inferior. Its identity or descriptors may disappear
       // before readback; only a previously identified process can prove its end.
-      if (!(await verifyOwnedInferiorsEnded([identity]))) throw cause;
-      session.knownInferiorIdentities.clear();
+      if (
+        !(await verifyOwnedInferiorsEnded(
+          [identity],
+          this.#readProcessStartTime,
+        ))
+      )
+        throw cause;
+      session.confirmedDetachedInferiorIdentity = undefined;
       return { status: "no-inferior" };
     }
-    return { status: "detached", outputSink: "durable" };
+    session.confirmedDetachedInferiorIdentity = undefined;
+    return { status: "detached", outputSink: "durable", inputSink };
   }
 
   async #verifyDebuggerExitPolicy(session: RizinDebugSession): Promise<void> {
@@ -1230,10 +1582,48 @@ export class RizinDebugSessionManager {
       throw new Error("Rizin dbg.exitkills readback did not confirm false.");
   }
 
+  async #replacementIsTracedByOwnedDebugger(
+    session: RizinDebugSession,
+    pid: string,
+    startTime: string,
+  ): Promise<boolean> {
+    const tracerPid = await this.#readProcessTracerPid(pid);
+    if (!Number.isSafeInteger(tracerPid) || tracerPid < 0)
+      throw new Error(`Inferior PID ${pid} has an invalid TracerPid value.`);
+    let tracedByOwnedDebugger = false;
+    if (tracerPid !== 0) {
+      const debuggerPid = session.launched.process.pid;
+      if (
+        debuggerPid === undefined ||
+        session.exited ||
+        session.launched.process.exitCode !== null ||
+        session.launched.process.signalCode !== null
+      )
+        throw new Error(
+          "The owned Rizin process is no longer available to verify the replacement inferior tracer.",
+        );
+      const taskIds = await this.#readProcessTaskIds(String(debuggerPid));
+      if (
+        session.exited ||
+        session.launched.process.exitCode !== null ||
+        session.launched.process.signalCode !== null
+      )
+        throw new Error(
+          "The owned Rizin process exited while its replacement inferior tracer was being verified.",
+        );
+      tracedByOwnedDebugger = taskIds.has(String(tracerPid));
+    }
+    assertRizinProcessStartTimeStable(
+      startTime,
+      await this.#readProcessStartTime(pid),
+    );
+    return tracedByOwnedDebugger;
+  }
+
   async #verifyInferiorOutputDescriptors(
     session: RizinDebugSession,
     pid: string,
-  ): Promise<void> {
+  ): Promise<InferiorInputSink> {
     for (const descriptor of ["1", "2"]) {
       const descriptorPath = `/proc/${pid}/fd/${descriptor}`;
       const destination = await readlink(descriptorPath);
@@ -1248,6 +1638,22 @@ export class RizinDebugSessionManager {
           `Inferior descriptor ${descriptor} is not routed to the selected TTY.`,
         );
     }
+    const identity = session.knownInferiorIdentities.get(pid);
+    if (identity === undefined)
+      throw new Error("Rizin has no owned identity for the selected inferior.");
+    return verifyInferiorInputSink(
+      pid,
+      {
+        path: session.inferiorTty,
+        dev: session.inferiorTtyDevice,
+        ino: session.inferiorTtyInode,
+      },
+      async () =>
+        assertRizinProcessStartTimeStable(
+          identity.startTime,
+          await this.#readProcessStartTime(pid),
+        ),
+    );
   }
 
   async #runInternalCommand(
@@ -1331,6 +1737,21 @@ export class RizinDebugSessionManager {
   }
 }
 
+const readLinuxProcessTracerPid = async (pid: string): Promise<number> => {
+  const status = await readFile(`/proc/${pid}/status`, "utf8");
+  const tracerPid = /^TracerPid:\s*(\d+)\s*$/m.exec(status)?.[1];
+  if (tracerPid === undefined)
+    throw new Error(`Inferior PID ${pid} has no readable TracerPid status.`);
+  const parsed = Number(tracerPid);
+  if (!Number.isSafeInteger(parsed))
+    throw new Error(`Inferior PID ${pid} has an invalid TracerPid status.`);
+  return parsed;
+};
+
+const readLinuxProcessTaskIds = async (
+  pid: string,
+): Promise<ReadonlySet<string>> => new Set(await readdir(`/proc/${pid}/task`));
+
 export interface RizinDebugCommandResult {
   readonly command: string;
   readonly output: string;
@@ -1385,6 +1806,26 @@ export const assertRizinProcessStartTimeStable = (
     throw new Error(
       "The inferior PID disappeared or was reused during detach verification.",
     );
+};
+
+/** Reject an empty ptrace inventory while a retained inferior identity is still present. */
+export const assertRizinEmptyInferiorInventory = async (
+  identities: Iterable<OwnedInferiorIdentity>,
+  readStartTime: (
+    pid: string,
+  ) => Promise<string | null> = readLinuxProcessStartTime,
+): Promise<void> => {
+  for (const identity of identities) {
+    const observed = await readStartTime(identity.pid);
+    if (observed === null) continue;
+    if (observed === identity.startTime)
+      throw new Error(
+        `Rizin reported no inferior while identified PID ${identity.pid} is still active.`,
+      );
+    // A different start time proves the original process ended and the PID
+    // now belongs to another process. Do not apply the old target's descriptor
+    // requirements to that new identity.
+  }
 };
 
 const hasUnclaimedRizinFrames = (session: RizinDebugSession): boolean =>

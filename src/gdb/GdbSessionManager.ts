@@ -31,6 +31,10 @@ import {
   type ProcessStartTimeReader,
   verifyOwnedInferiorsEnded,
 } from "../process/ownedDebuggerSession.js";
+import {
+  verifyInferiorInputSink,
+  type InferiorInputSink,
+} from "../process/inferiorInputSink.js";
 import { parseLinuxProcessStat } from "../process/LinuxProcessStat.js";
 
 const STARTUP_TIMEOUT_MS = 10_000;
@@ -391,7 +395,7 @@ const verifyGdbInferiorOutputSink = async (
   pid: string,
   selectedTty: string,
   rememberIdentity: (identity: OwnedInferiorIdentity) => void,
-): Promise<void> => {
+): Promise<InferiorInputSink> => {
   if (process.platform !== "linux")
     throw new Error(
       "GDB cannot confirm live inferior output descriptors outside Linux /proc.",
@@ -428,7 +432,27 @@ const verifyGdbInferiorOutputSink = async (
     throw new Error(
       "The GDB inferior identity changed during descriptor readback.",
     );
+  // Preserve the proven identity even if fd 0 cannot be classified. A later
+  // retry can then confirm that the inferior ended after GDB exits.
   rememberIdentity({ pid, startTime: before });
+  const inputSink = await verifyInferiorInputSink(
+    pid,
+    {
+      path: ttyPath,
+      dev: tty.dev,
+      ino: tty.ino,
+    },
+    async () => {
+      const currentStat = parseLinuxProcessStat(
+        await readFile(statPath, "utf8"),
+      );
+      if (currentStat?.pid !== expectedPid || currentStat.startTime !== before)
+        throw new Error(
+          "The GDB inferior identity changed while verifying its closed stdin descriptor.",
+        );
+    },
+  );
+  return inputSink;
 };
 
 class GdbCommandProcessExitError extends Error {
@@ -514,7 +538,7 @@ export class GdbSessionManager {
     pid: string,
     selectedTty: string,
     rememberIdentity: (identity: OwnedInferiorIdentity) => void,
-  ) => Promise<void>;
+  ) => Promise<InferiorInputSink>;
   readonly #readInferiorProcessStartTime: ProcessStartTimeReader | undefined;
   readonly #maxSessions: number;
   readonly #maxCommandOutputBytes: number;
@@ -535,7 +559,7 @@ export class GdbSessionManager {
         pid: string,
         selectedTty: string,
         rememberIdentity: (identity: OwnedInferiorIdentity) => void,
-      ) => Promise<void>;
+      ) => Promise<InferiorInputSink>;
       /** @internal Read-only process identity observer for lifecycle tests. */
       readonly readInferiorProcessStartTime?: ProcessStartTimeReader;
       readonly maxSessions?: number;
@@ -709,10 +733,37 @@ export class GdbSessionManager {
     >
   > {
     let launched: SpawnedOwnedProviderProcess;
+    const callerRunId = Object.hasOwn(this.#environment, "REA_PROCESS_RUN_ID")
+      ? this.#environment.REA_PROCESS_RUN_ID
+      : undefined;
+    if (
+      callerRunId !== undefined &&
+      (/[\r\n]/u.test(callerRunId) || /^\s|\s$/u.test(callerRunId))
+    ) {
+      releaseReservation();
+      return err(
+        new AnalysisCapabilityUnavailableError(
+          "gdb",
+          "start_gdb_session",
+          "The caller's REA_PROCESS_RUN_ID contains a line break or boundary whitespace and cannot be preserved for the inferior.",
+        ),
+      );
+    }
     try {
       const spawnOptions: OwnedProviderProcessSpawnOptions = {
         command: this.#command,
-        arguments: ["--nx", "--quiet", `--interpreter=${miVersion}`],
+        arguments: [
+          "--nx",
+          "--quiet",
+          `--interpreter=${miVersion}`,
+          // GDB inherits REA's ownership token; the inferior must see the
+          // caller's value (or none) so a later sweep cannot mistake it for an
+          // owned process. Applied before any inferior exists, so no MI request.
+          "-iex",
+          callerRunId === undefined
+            ? "unset environment REA_PROCESS_RUN_ID"
+            : `set environment REA_PROCESS_RUN_ID =${callerRunId}`,
+        ],
         runId: randomUUID(),
         stdin: "pipe",
         hostEnvironment: this.#environment,
@@ -1837,7 +1888,7 @@ export class GdbSessionManager {
       throw new Error(
         "GDB no longer reports the caller-selected inferior TTY; detachment cannot be confirmed safely.",
       );
-    await this.#verifyInferiorOutputSink(
+    const inputSink = await this.#verifyInferiorOutputSink(
       inferiorPids[0]!,
       session.inferiorTty!,
       (identity) =>
@@ -1846,6 +1897,10 @@ export class GdbSessionManager {
           identity,
         ),
     );
+    if (inputSink !== "durable" && inputSink !== "not-inherited")
+      throw new Error(
+        "GDB inferior descriptor readback did not confirm an independent input sink.",
+      );
     const detached = await this.#request(session, "-target-detach");
     if (
       detached.completion_status !== "complete" ||
@@ -1854,7 +1909,11 @@ export class GdbSessionManager {
     )
       throw new Error("GDB did not confirm inferior detachment.");
     session.knownInferiorIdentities.clear();
-    return { status: "detached", outputSink: "durable" };
+    return {
+      status: "detached",
+      outputSink: "durable",
+      inputSink,
+    };
   }
 
   async #settleExitedCommands(
@@ -2286,20 +2345,37 @@ export const commandMayChangeInferiorOutput = (command: string): boolean => {
   const firstToken = /^\s*([^\s;]+)/u.exec(command)?.[1]?.toLowerCase();
   const mayBeTtyCommand =
     firstToken !== undefined && "tty".startsWith(firstToken);
+  // `s` is GDB's built-in alias for `step`, not a `source` abbreviation.
+  // Require the unambiguous `sour` prefix before treating it as source.
+  const mayBeSourceCommand =
+    firstToken !== undefined &&
+    firstToken.length >= 2 &&
+    firstToken !== "s" &&
+    "source".startsWith(firstToken);
   const mayDefineAlias =
     firstToken !== undefined && "alias".startsWith(firstToken);
-  const mayRunWithOutputRedirection =
+  const runCommand =
     firstToken !== undefined &&
-    ["run", "start", "starti"].some((name) => name.startsWith(firstToken)) &&
-    /[<>]{1,2}|&>/u.test(command.slice(firstToken.length));
+    ["run", "start", "starti"].some((name) => name.startsWith(firstToken));
+  const runTail = runCommand ? command.slice(firstToken.length) : "";
+  // GDB accepts an input-only redirection for the inferior. It does not change
+  // stdout/stderr, which are independently verified from the live process at
+  // close time. Keep the exception narrow: compound commands and any output
+  // redirection still revoke the startup proof.
+  const inputOnlyRunRedirection =
+    runCommand &&
+    /^\s+(?:[^<>;&|\r\n]+\s+)?<\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s<>;&|]+)\s*$/u.test(
+      runTail,
+    );
+  const mayRunWithOutputRedirection =
+    runCommand && /[<>]{1,2}|&>/u.test(runTail) && !inputOnlyRunRedirection;
   return (
     maySetInferiorTty ||
     mayBeTtyCommand ||
+    mayBeSourceCommand ||
     mayDefineAlias ||
     /\binferior-tty\b/iu.test(command) ||
-    /^\s*(?:wit(?:h)?(?:\s|$)|tty(?:\s|$)|source\b|py\w*|define\b)/iu.test(
-      command,
-    ) ||
+    /^\s*(?:wit(?:h)?(?:\s|$)|tty(?:\s|$)|py\w*|define\b)/iu.test(command) ||
     mayRunWithOutputRedirection
   );
 };
