@@ -292,6 +292,7 @@ const retainBrowserObservation = (
   ) {
     const bundle = webBundleAnalysisSchema.safeParse(partial);
     if (!bundle.success) {
+      if (error instanceof AnalysisCancelledError) return err(error);
       const malformed = new AnalysisOutputError(
         errorOperation,
         "Browser provider retained malformed completed bundle facts.",
@@ -325,14 +326,6 @@ const retainBrowserObservation = (
     return err(error);
   const inspection = webPageInspectionSchema.safeParse(partial);
   if (!inspection.success) {
-    if (error instanceof AnalysisCancelledError)
-      return err(
-        new AnalysisOutputError(
-          errorOperation,
-          "Browser provider retained a malformed completed page inspection.",
-          { cause: inspection.error },
-        ),
-      );
     return err(error);
   }
   const pageInput: InspectWebPageInput =

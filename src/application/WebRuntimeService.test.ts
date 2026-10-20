@@ -6,10 +6,13 @@ import {
   webListenersFixture,
 } from "./WebRuntimeService.fixture.js";
 import { err, ok } from "../domain/result.js";
-import { AnalysisTimeoutError } from "../domain/analysisErrorCore.js";
+import {
+  AnalysisCancelledError,
+  AnalysisOutputError,
+  AnalysisTimeoutError,
+} from "../domain/analysisErrorCore.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { parseEvidence } from "../domain/evidence.js";
-import { AnalysisOutputError } from "../domain/analysisErrorCore.js";
 
 it("rejects malformed input and prior cancellation without calling a provider", async () => {
   const provider = recordingWebRuntimePort();
@@ -101,6 +104,55 @@ it("converts raw execution retained by provider cleanup failure into partial Evi
     });
   }
 });
+
+it.each([
+  {
+    method: "observe" as const,
+    operation: "observe_web_execution",
+    partial: { instrumentation: {}, window: {} },
+  },
+  {
+    method: "inspect" as const,
+    operation: "inspect_web_event_listeners",
+    partial: { selected_node: {}, listeners: [] },
+  },
+])(
+  "preserves cancellation with malformed $method observations",
+  async ({ method, operation, partial }) => {
+    const reason = { requested: `stop ${method}` };
+    const failure = new AnalysisCancelledError(operation, {
+      cause: reason,
+      partialObservation: partial as never,
+    });
+    const port = recordingWebRuntimePort();
+    const service = new WebRuntimeService({
+      identity: () => port.identity(),
+      observeExecution: async () => err(failure),
+      inspectEventListeners: async () => err(failure),
+    });
+    const input =
+      method === "observe"
+        ? {
+            cdp_endpoint: "http://127.0.0.1:9222",
+            target_id: "selected-page",
+            observation_ms: 5,
+          }
+        : {
+            cdp_endpoint: "http://127.0.0.1:9222",
+            target_id: "selected-page",
+            selector: "#selected",
+          };
+
+    const result =
+      method === "observe"
+        ? await service.observe(input)
+        : await service.inspect(input);
+
+    expect(result).toEqual(err(failure));
+    expect(failure.cause).toBe(reason);
+    expect(failure.partialObservation).toBe(partial);
+  },
+);
 
 it("retains completed execution Evidence on late abort and keeps invalid output primary", async () => {
   const input = {

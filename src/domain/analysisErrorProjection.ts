@@ -1,7 +1,6 @@
 import { projectArtifactIntegrityDetails } from "./artifactIntegrity.js";
 import type { AnalysisErrorRecovery } from "./analysisErrorRecovery.js";
 import { jsonValueSchema, type JsonValue } from "./jsonValue.js";
-import { isImmutableJsonSnapshot } from "./immutableJson.js";
 
 import {
   analysisErrorCategory,
@@ -64,6 +63,10 @@ export const projectAnalysisError = (
   const capturedOutput = composed.capturedOutput ?? error.capturedOutput;
   const partialObservation =
     composed.partialObservation ?? error.partialObservation;
+  const partialObservationJson =
+    partialObservation === undefined
+      ? undefined
+      : jsonValueSchema.safeParse(partialObservation);
   assertKnownAnalysisErrorTag(error._tag);
   const underlyingCode = underlyingErrorCode(error);
   const code = error.cleanupIncomplete ? "cleanup_incomplete" : underlyingCode;
@@ -97,11 +100,9 @@ export const projectAnalysisError = (
         }),
     ...(partialObservation === undefined
       ? {}
-      : {
-          partial_observation: isImmutableJsonSnapshot(partialObservation)
-            ? partialObservation
-            : jsonValueSchema.parse(partialObservation),
-        }),
+      : partialObservationJson?.success
+        ? { partial_observation: partialObservationJson.data }
+        : { partial_observation_omitted: "invalid_json" }),
   };
   const recovery = errorRecovery(error);
   return {

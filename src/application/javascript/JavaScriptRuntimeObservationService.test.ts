@@ -233,6 +233,41 @@ it("converts a raw runtime observation retained by cleanup failure", async () =>
   }
 });
 
+it("preserves cancellation and malformed partial runtime observation", async () => {
+  const reason = { requested: "stop while collecting scripts" };
+  const partial = { runtime: "partial", scripts: [] };
+  const failure = new AnalysisCancelledError("observe_javascript_runtime", {
+    cause: reason,
+    partialObservation: partial as never,
+  });
+  const result = await observeJavaScriptRuntime(
+    {
+      identity: () => ({ id: "test", name: "Test", version: "1" }),
+      listTargets: async () =>
+        ok({
+          runtime: {
+            product: "node.js/v24",
+            protocol_version: "1.3",
+            v8_version: "13",
+          },
+          targets: [],
+          excluded: { unsupported_location: 0, unconnectable: 0 },
+          limitations: [],
+        }),
+      observe: async () => err(failure),
+    },
+    {
+      inspector_endpoint: "http://127.0.0.1:9229",
+      target_id: "target",
+      observation_ms: 0,
+    },
+  );
+
+  expect(result).toEqual(err(failure));
+  expect(failure.cause).toBe(reason);
+  expect(failure.partialObservation).toBe(partial);
+});
+
 it("reports non-JSON Inspector output before late cancellation", async () => {
   const controller = new AbortController();
   const value = {

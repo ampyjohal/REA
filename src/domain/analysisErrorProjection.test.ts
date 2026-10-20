@@ -447,6 +447,28 @@ it("projects native partial observations through healthy cancellation failures",
   expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(true);
 });
 
+it("keeps cancellation when a retained partial observation is not JSON", () => {
+  const projected = projectAnalysisError(
+    new AnalysisCancelledError("analyze_web_bundle", {
+      partialObservation: {
+        observations: [],
+        capture: { status: "partial", measured_value: Number.NaN },
+      } as never,
+    }),
+  );
+
+  expect(projected).toMatchObject({
+    code: "cancelled",
+    details: {
+      operation: "analyze_web_bundle",
+      partial_observation_omitted: "invalid_json",
+    },
+  });
+  expect(projected.details).not.toHaveProperty("partial_observation");
+  expect(analysisErrorProjectionSchema.safeParse(projected).success).toBe(true);
+  expect(() => JSON.stringify(projected)).not.toThrow();
+});
+
 it("retains native partial observations and cleanup uncertainty on provider failures", () => {
   const projected = projectAnalysisError(
     new ProviderAdapterError("native-lldb", "observe_native_calls", {

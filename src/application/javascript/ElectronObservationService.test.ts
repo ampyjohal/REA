@@ -102,6 +102,31 @@ it("converts a retained raw Electron inspection into partial Evidence", async ()
   }
 });
 
+it("preserves cancellation and malformed partial Electron inspection", async () => {
+  const reason = { requested: "stop during page inspection" };
+  const partial = {
+    kind: "electron-page-observation",
+    inspection: { target_id: "electron-page" },
+    cleanup: "incomplete",
+  };
+  const failure = new AnalysisCancelledError("inspect_electron_page", {
+    cause: reason,
+    partialObservation: partial as never,
+  });
+  const provider: ElectronObservationPort = {
+    identity: () => identity,
+    listTargets: async () =>
+      err(new AnalysisCancelledError("list_electron_targets")),
+    inspectPage: async () => err(failure),
+  };
+
+  const result = await inspectElectronPage(provider, input);
+
+  expect(result).toEqual(err(failure));
+  expect(failure.cause).toBe(reason);
+  expect(failure.partialObservation).toBe(partial);
+});
+
 it("converts a raw inspection retained by provider cleanup failure", async () => {
   const failure = new ProviderCleanupError(
     "rea-cdp-electron",

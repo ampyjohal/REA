@@ -1,6 +1,9 @@
 import { expect, it } from "vitest";
 
-import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
+import {
+  AnalysisCancelledError,
+  AnalysisOutputError,
+} from "../domain/analysisErrorCore.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { parseEvidence } from "../domain/evidence.js";
 import { browserScenarioInputSchema } from "../domain/browserScenario.js";
@@ -40,6 +43,51 @@ it("converts a retained raw scenario capture into partial Evidence", async () =>
       normalized_result: capture,
     });
   }
+});
+
+it("preserves cancellation and malformed startup capture data", async () => {
+  const reason = { requested: "stop during startup" };
+  const partial = {
+    kind: "browser-scenario-observation",
+    capture: { browser: { cleanup: "incomplete" }, steps: [] },
+  };
+  const failure = new AnalysisCancelledError("capture_browser_scenario", {
+    cause: reason,
+    partialObservation: partial as never,
+  });
+  const provider: BrowserScenarioCapturePort = {
+    identity: () => ({
+      id: "scenario-fixture",
+      name: "Scenario fixture",
+      version: "1",
+    }),
+    captureScenario: async () => err(failure),
+  };
+
+  const result = await captureBrowserScenario(provider, scenario);
+
+  expect(result).toEqual(err(failure));
+  expect(failure.cause).toBe(reason);
+  expect(failure.partialObservation).toBe(partial);
+});
+
+it("keeps malformed successful captures classified as output errors", async () => {
+  const provider: BrowserScenarioCapturePort = {
+    identity: () => ({
+      id: "scenario-fixture",
+      name: "Scenario fixture",
+      version: "1",
+    }),
+    captureScenario: async () => ({ ok: true, value: {} as never }),
+  };
+
+  const result = await captureBrowserScenario(provider, scenario);
+
+  expect(result).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisOutputError" },
+  });
+  if (!result.ok) expect(result.error).toBeInstanceOf(AnalysisOutputError);
 });
 
 it("converts a raw scenario capture retained after cleanup failure", async () => {

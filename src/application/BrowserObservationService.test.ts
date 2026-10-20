@@ -3,7 +3,10 @@ import type { BrowserObservationPort } from "./BrowserObservationPort.js";
 import { listBrowserTargets } from "./BrowserObservationService.js";
 import type { BrowserTargetList } from "../domain/browserObservationSchemas.js";
 import { parseEvidence } from "../domain/evidence.js";
-import { AnalysisOutputError } from "../domain/analysisErrorCore.js";
+import {
+  AnalysisCancelledError,
+  AnalysisOutputError,
+} from "../domain/analysisErrorCore.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import { ok } from "../domain/result.js";
 import { passiveNetworkCapture } from "../../tests/fixtures/passiveNetworkCapture.js";
@@ -130,6 +133,33 @@ it("converts a raw page inspection retained after browser cleanup failure", asyn
   }
 });
 
+it("preserves cancellation and malformed partial page inspection", async () => {
+  const pageInput = inspectWebPageInputSchema.parse({
+    cdp_endpoint: input.cdp_endpoint.recorded,
+    allowed_origins: [],
+    target_id: "page",
+    observation_ms: 0,
+    include_script_sources: false,
+  });
+  const reason = { requested: "stop during page inspection" };
+  const partial = { target: {}, network: {}, capture_window: {} };
+  const failure = new AnalysisCancelledError("inspect_web_page", {
+    cause: reason,
+    partialObservation: partial as never,
+  });
+  const browser: BrowserObservationPort = {
+    identity: () => ({ id: "browser-fixture", name: "Fixture", version: "1" }),
+    listTargets: async () => ok(report),
+    inspectPage: async () => ({ ok: false, error: failure }),
+  } as unknown as BrowserObservationPort;
+
+  const result = await inspectWebPage(browser, pageInput);
+
+  expect(result).toEqual({ ok: false, error: failure });
+  expect(failure.cause).toBe(reason);
+  expect(failure.partialObservation).toBe(partial);
+});
+
 it("retains captured page Evidence when bundle analysis fails after capture", async () => {
   const inspection = passiveNetworkCapture();
   const failure = new BrowserObservationError(
@@ -158,6 +188,32 @@ it("retains captured page Evidence when bundle analysis fails after capture", as
       normalized_result: inspection,
     });
   }
+});
+
+it("preserves cancellation and malformed partial bundle facts", async () => {
+  const reason = { requested: "stop during bundle analysis" };
+  const partial = { observations: [], capture: { status: "partial" } };
+  const failure = new AnalysisCancelledError("analyze_web_bundle", {
+    cause: reason,
+    partialObservation: partial as never,
+  });
+  const browser: BrowserObservationPort = {
+    ...provider(async () => ok(report)),
+    analyzeBundle: async () => ({ ok: false, error: failure }),
+  } as unknown as BrowserObservationPort;
+  const selected = analyzeWebBundleInputSchema.parse({
+    cdp_endpoint: input.cdp_endpoint.recorded,
+    target_id: "page",
+    max_heap_mb: 256,
+    analysis_timeout_ms: 100,
+    total_analysis_timeout_ms: 1000,
+  });
+
+  const result = await analyzeWebBundle(browser, selected);
+
+  expect(result).toEqual({ ok: false, error: failure });
+  expect(failure.cause).toBe(reason);
+  expect(failure.partialObservation).toBe(partial);
 });
 
 it("retains completed bundle facts as bundle Evidence after cancellation", async () => {

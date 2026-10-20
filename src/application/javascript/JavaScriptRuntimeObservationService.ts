@@ -76,14 +76,6 @@ export const observeJavaScriptRuntime = async (
       !("kind" in partial)
     ) {
       const report = javascriptRuntimeObservationSchema.safeParse(partial);
-      if (!report.success && result.error instanceof AnalysisCancelledError)
-        return err(
-          new AnalysisOutputError(
-            "observe_javascript_runtime",
-            "Inspector retained a malformed completed runtime observation.",
-            { cause: report.error },
-          ),
-        );
       if (report.success)
         result.error.partialObservation =
           createJavaScriptRuntimeObservationEvidence(

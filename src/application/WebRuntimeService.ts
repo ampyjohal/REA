@@ -56,14 +56,7 @@ export class WebRuntimeService {
           if (evidence.ok) result.error.partialObservation = evidence.value;
           else if (result.error instanceof AnalysisCancelledError)
             return evidence;
-        } else if (result.error instanceof AnalysisCancelledError)
-          return err(
-            new AnalysisOutputError(
-              operation,
-              "Provider retained a malformed completed execution observation.",
-              { cause: verifiedPartial.error },
-            ),
-          );
+        }
       }
       return result;
     }
@@ -118,14 +111,7 @@ export class WebRuntimeService {
           if (evidence.ok) result.error.partialObservation = evidence.value;
           else if (result.error instanceof AnalysisCancelledError)
             return evidence;
-        } else if (result.error instanceof AnalysisCancelledError)
-          return err(
-            new AnalysisOutputError(
-              operation,
-              "Provider retained malformed completed event-listener data.",
-              { cause: verifiedPartial.error },
-            ),
-          );
+        }
       }
       return result;
     }

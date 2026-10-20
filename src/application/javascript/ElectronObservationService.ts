@@ -80,14 +80,6 @@ export const inspectElectronPage = async (
     ) {
       const report = electronPageInspectionSchema.safeParse(partial.inspection);
       if (!report.success) {
-        if (result.error instanceof AnalysisCancelledError)
-          return err(
-            new AnalysisOutputError(
-              "inspect_electron_page",
-              "Electron provider retained a malformed completed page inspection.",
-              { cause: report.error },
-            ),
-          );
         return result;
       }
       const inspection = {

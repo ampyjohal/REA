@@ -53,14 +53,6 @@ export const captureBrowserScenario = async (
           provider.identity(),
         );
       } else if (!report.success) {
-        if (captured.error instanceof AnalysisCancelledError)
-          return err(
-            new AnalysisOutputError(
-              OPERATION,
-              "Browser scenario provider retained a malformed completed capture.",
-              { cause: report.error },
-            ),
-          );
         return captured;
       }
     }
