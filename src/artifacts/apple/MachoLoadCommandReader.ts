@@ -33,6 +33,7 @@ const LC_LOAD_WEAK_DYLIB = 0x80000018;
 const LC_REEXPORT_DYLIB = 0x8000001f;
 const LC_LAZY_LOAD_DYLIB = 0x20;
 const LC_LOAD_UPWARD_DYLIB = 0x80000023;
+const LC_LAZY_LOAD_DYLIB_INFO = 0x3a;
 const LC_RPATH = 0x8000001c;
 const LC_DYLD_ENVIRONMENT = 0x27;
 const LC_CODE_SIGNATURE = 0x1d;
@@ -89,6 +90,16 @@ const DYLIB_USE_WEAK_LINK = 0x1;
 const DYLIB_USE_REEXPORT = 0x2;
 const DYLIB_USE_UPWARD = 0x4;
 const DYLIB_USE_DELAYED_INIT = 0x8;
+
+/**
+ * dyld's `LazyLoadDylibLinkEdit` (dyld `mach_o/LazyLoadDylib.h`), the
+ * __LINKEDIT payload of `LC_LAZY_LOAD_DYLIB_INFO`: loadPathOffset,
+ * flagImageOffset, flags, pointerFormat, chainStartImageOffset, symbolsCount
+ * and symbolStringArrayOffset, followed by the path and symbol strings.
+ */
+const LAZY_LOAD_DYLIB_INFO_HEADER_BYTES = 24;
+/** `LazyLoadDylib::dylibMayBeMissing()`: the lazy dylib is weak linked. */
+const LAZY_LOAD_DYLIB_WEAK_LINK = 0x1;
 
 const DEPENDENCY_COMMANDS: ReadonlyMap<number, MachoDependency["command"]> =
   new Map([
@@ -293,7 +304,7 @@ const readSlice = async (
       commandBytes,
       "load commands",
     );
-    const slice = decodeCommands(commands, {
+    const slice = await decodeCommands(readAt, commands, {
       wide,
       cpuType: identity.cpuType,
       cpuSubtype: identity.cpuSubtype,
@@ -320,7 +331,8 @@ const readSlice = async (
   );
 };
 
-const decodeCommands = (
+const decodeCommands = async (
+  readAt: ReadAt,
   bytes: Uint8Array,
   header: {
     readonly wide: boolean;
@@ -334,7 +346,7 @@ const decodeCommands = (
     readonly fatCpuSubtype: number | null;
     readonly fatAlignmentExponent: number | null;
   },
-): MachoSlice => {
+): Promise<MachoSlice> => {
   const view = viewOf(bytes);
   const slice: MachoSlice = {
     architecture: architectureName(header.cpuType, header.cpuSubtype),
@@ -374,7 +386,11 @@ const decodeCommands = (
         `load command ${index} at offset ${offset} has invalid cmdsize ${size}`,
       );
     const body = bytes.subarray(offset, offset + size);
-    decodeCommand(command, body, index, slice);
+    if (command === LC_LAZY_LOAD_DYLIB_INFO)
+      slice.dependencies.push(
+        await readLazyLoadDylibInfo(readAt, body, index, header),
+      );
+    else decodeCommand(command, body, index, slice);
     offset += size;
   }
   if (offset !== bytes.byteLength)
@@ -473,8 +489,86 @@ const decodeDependency = (
     reexport:
       command === "LC_REEXPORT_DYLIB" || (flags & DYLIB_USE_REEXPORT) !== 0,
     delayed_init: (flags & DYLIB_USE_DELAYED_INIT) !== 0,
+    lazy: command === "LC_LAZY_LOAD_DYLIB",
     current_version: version(view.getUint32(16, true)),
     compatibility_version: version(view.getUint32(20, true)),
+  };
+};
+
+/**
+ * Decode one `LC_LAZY_LOAD_DYLIB_INFO` record from its __LINKEDIT payload.
+ * Validation follows dyld's `LazyLoadDylib::valid()` except for the flag and
+ * chain-start image offsets, which need the VM layout and do not affect
+ * which dylib is named.
+ */
+const readLazyLoadDylibInfo = async (
+  readAt: ReadAt,
+  body: Uint8Array,
+  index: number,
+  slice: { readonly sliceOffset: number; readonly sliceSize: number },
+): Promise<MachoDependency> => {
+  // linkedit_data_command: cmd, cmdsize, dataoff, datasize.
+  if (body.byteLength < 16)
+    throw new MachoFormatIssue(
+      "malformed",
+      `load command ${index} is too short for LC_LAZY_LOAD_DYLIB_INFO`,
+    );
+  const command = viewOf(body);
+  const dataOffset = command.getUint32(8, true);
+  const dataSize = command.getUint32(12, true);
+  if (dataSize > MAX_LOAD_COMMAND_BYTES)
+    throw new MachoFormatIssue(
+      "unsupported",
+      `load command ${index} LC_LAZY_LOAD_DYLIB_INFO data occupies ${dataSize} bytes, above the ${MAX_LOAD_COMMAND_BYTES}-byte limit`,
+    );
+  if (dataOffset + dataSize > slice.sliceSize)
+    throw new MachoFormatIssue(
+      "malformed",
+      `load command ${index} LC_LAZY_LOAD_DYLIB_INFO data extends beyond the Mach-O slice`,
+    );
+  if (dataSize < LAZY_LOAD_DYLIB_INFO_HEADER_BYTES)
+    throw new MachoFormatIssue(
+      "malformed",
+      `load command ${index} LC_LAZY_LOAD_DYLIB_INFO data is too short for its header`,
+    );
+  const blob = await readExact(
+    readAt,
+    slice.sliceOffset + dataOffset,
+    dataSize,
+    `load command ${index} LC_LAZY_LOAD_DYLIB_INFO data`,
+  );
+  const view = viewOf(blob);
+  const symbolCount = view.getUint32(16, true);
+  const symbolArrayOffset = view.getUint32(20, true);
+  if (symbolArrayOffset + symbolCount * 4 > dataSize)
+    throw new MachoFormatIssue(
+      "malformed",
+      `load command ${index} LC_LAZY_LOAD_DYLIB_INFO symbol table exceeds its data`,
+    );
+  for (let symbol = 0; symbol < symbolCount; symbol++)
+    if (view.getUint32(symbolArrayOffset + symbol * 4, true) > dataSize)
+      throw new MachoFormatIssue(
+        "malformed",
+        `load command ${index} LC_LAZY_LOAD_DYLIB_INFO symbol ${symbol} is outside its data`,
+      );
+  const pathOffset = view.getUint32(0, true);
+  if (pathOffset >= dataSize)
+    throw new MachoFormatIssue(
+      "malformed",
+      `load command ${index} LC_LAZY_LOAD_DYLIB_INFO path offset ${pathOffset} is outside its data`,
+    );
+  return {
+    command: "LC_LAZY_LOAD_DYLIB_INFO",
+    encoding: "lazy_load_dylib_info",
+    install_name: terminatedString(blob, pathOffset, index),
+    weak: (view.getUint16(8, true) & LAZY_LOAD_DYLIB_WEAK_LINK) !== 0,
+    upward: false,
+    reexport: false,
+    delayed_init: false,
+    lazy: true,
+    // The record carries no dylib versions.
+    current_version: null,
+    compatibility_version: null,
   };
 };
 
@@ -495,7 +589,16 @@ const commandString = (
       "malformed",
       `load command ${index} has string offset ${offset} outside the command`,
     );
-  const end = body.indexOf(0, offset);
+  return terminatedString(body, offset, index);
+};
+
+/** NUL-terminated UTF-8 string starting at `offset` inside one record. */
+const terminatedString = (
+  bytes: Uint8Array,
+  offset: number,
+  index: number,
+): string => {
+  const end = bytes.indexOf(0, offset);
   if (end < 0)
     throw new MachoFormatIssue(
       "malformed",
@@ -504,7 +607,7 @@ const commandString = (
   try {
     // lc_str contains name/path data, so a leading U+FEFF is part of its identity.
     return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
-      body.subarray(offset, end),
+      bytes.subarray(offset, end),
     );
   } catch {
     throw new MachoFormatIssue(

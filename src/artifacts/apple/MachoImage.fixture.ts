@@ -7,6 +7,7 @@ export const LC = {
   REEXPORT_DYLIB: 0x8000001f,
   LAZY_LOAD_DYLIB: 0x20,
   LOAD_UPWARD_DYLIB: 0x80000023,
+  LAZY_LOAD_DYLIB_INFO: 0x3a,
   RPATH: 0x8000001c,
   DYLD_ENVIRONMENT: 0x27,
   CODE_SIGNATURE: 0x1d,
@@ -102,18 +103,71 @@ export const versionMinCommand = (command: number): Uint8Array => {
   return bytes;
 };
 
+/**
+ * dyld's `LazyLoadDylibLinkEdit` payload as Apple's linker lays it out: the
+ * 24-byte header, the symbol offset array, the path and the symbol names.
+ */
+export const lazyLoadDylibInfo = (
+  path: string,
+  options: {
+    readonly flags?: number;
+    readonly symbols?: readonly string[];
+  } = {},
+): Uint8Array => {
+  const symbols = (options.symbols ?? ["_lf"]).map((name) =>
+    encoder.encode(name),
+  );
+  const name = encoder.encode(path);
+  const pathOffset = 24 + symbols.length * 4;
+  let end = pathOffset + name.length + 1;
+  const symbolOffsets = symbols.map((symbol) => {
+    const offset = end;
+    end += symbol.length + 1;
+    return offset;
+  });
+  const bytes = new Uint8Array(Math.ceil(end / 8) * 8);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, pathOffset, true);
+  view.setUint32(4, 0x8008, true);
+  view.setUint16(8, options.flags ?? 0, true);
+  view.setUint16(10, 6, true);
+  view.setUint32(12, 0x8000, true);
+  view.setUint32(16, symbols.length, true);
+  view.setUint32(20, 24, true);
+  symbolOffsets.forEach((offset, index) => {
+    view.setUint32(24 + index * 4, offset, true);
+    bytes.set(symbols[index] ?? new Uint8Array(), offset);
+  });
+  bytes.set(name, pathOffset);
+  return bytes;
+};
+
 /** A 64-bit (or 32-bit) little-endian Mach-O image made of the given commands. */
 export const machoImage = (options: {
   readonly cpu?: { readonly type: number; readonly subtype: number };
   readonly fileType?: number;
   readonly commands?: readonly Uint8Array[];
+  /** `linkedit_data_command`s appended to `commands`, with data placed after them. */
+  readonly linkedit?: readonly {
+    readonly command: number;
+    readonly data: Uint8Array;
+  }[];
   readonly wide?: boolean;
 }): Uint8Array => {
   const wide = options.wide ?? true;
-  const commands = options.commands ?? [];
+  const linkedit = options.linkedit ?? [];
+  const commands = [
+    ...(options.commands ?? []),
+    ...linkedit.map(() => new Uint8Array(16)),
+  ];
   const headerSize = wide ? 32 : 28;
   const commandBytes = commands.reduce((total, item) => total + item.length, 0);
-  const bytes = new Uint8Array(headerSize + commandBytes + 16);
+  const dataStart = headerSize + commandBytes + 16;
+  const dataBytes = linkedit.reduce(
+    (total, item) => total + item.data.length,
+    0,
+  );
+  const bytes = new Uint8Array(dataStart + dataBytes);
   const view = new DataView(bytes.buffer);
   const cpu = options.cpu ?? CPU.arm64;
   view.setUint32(0, wide ? 0xfeedfacf : 0xfeedface, true);
@@ -126,6 +180,17 @@ export const machoImage = (options: {
   for (const command of commands) {
     bytes.set(command, offset);
     offset += command.length;
+  }
+  let dataOffset = dataStart;
+  let commandOffset = headerSize + commandBytes - linkedit.length * 16;
+  for (const { command, data } of linkedit) {
+    view.setUint32(commandOffset, command, true);
+    view.setUint32(commandOffset + 4, 16, true);
+    view.setUint32(commandOffset + 8, dataOffset, true);
+    view.setUint32(commandOffset + 12, data.length, true);
+    bytes.set(data, dataOffset);
+    commandOffset += 16;
+    dataOffset += data.length;
   }
   return bytes;
 };

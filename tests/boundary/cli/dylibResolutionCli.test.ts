@@ -1,4 +1,4 @@
-import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { describe, expect } from "vitest";
@@ -11,6 +11,7 @@ import {
   dylibCommand,
   dyldEnvironmentCommand,
   fatImage,
+  lazyLoadDylibInfo,
   machoImage,
   rpathCommand,
 } from "../../../src/artifacts/apple/MachoImage.fixture.js";
@@ -154,6 +155,73 @@ cliTest(
     );
     expect(helper).toBeDefined();
     expect(helper?.resolution.image).toBeNull();
+  },
+);
+
+cliTest(
+  "resolves LC_LAZY_LOAD_DYLIB_INFO dependencies as lazy loads",
+  async ({ cli }) => {
+    const directory = await createTestTempDirectory("rea-dylib-lazy-");
+    const executable = join(directory, "lazy");
+    // Apple's linker encodes `-lazy_library` as LC_LAZY_LOAD_DYLIB_INFO.
+    await writeFiles(directory, {
+      lazy: machoImage({
+        commands: [
+          buildVersionCommand(1),
+          dylibCommand(LC.LOAD_DYLIB, "/usr/lib/libSystem.B.dylib"),
+          rpathCommand("@executable_path/lib"),
+        ],
+        linkedit: [
+          {
+            command: LC.LAZY_LOAD_DYLIB_INFO,
+            data: lazyLoadDylibInfo("@rpath/libl.dylib"),
+          },
+        ],
+      }),
+      "lib/libl.dylib": machoImage({
+        fileType: FILE_TYPE.dylib,
+        commands: [
+          buildVersionCommand(1),
+          dylibCommand(LC.ID_DYLIB, "@rpath/libl.dylib"),
+        ],
+      }),
+    });
+    const trace = async () => {
+      const output = await cli.run({
+        arguments: ["trace-dylib-resolution", executable, "--json"],
+        environment: ENVIRONMENT,
+      });
+      expect(output.exitCode, output.stderr).toBe(0);
+      return dylibResolutionResultSchema.parse(
+        parseEvidence(output.json).normalized_result,
+      );
+    };
+    const lazyEdge = (result: Awaited<ReturnType<typeof trace>>) =>
+      result.edges.find(
+        ({ install_name }) => install_name === "@rpath/libl.dylib",
+      );
+    const present = await trace();
+    expect(lazyEdge(present)).toMatchObject({
+      command: "LC_LAZY_LOAD_DYLIB_INFO",
+      encoding: "lazy_load_dylib_info",
+      lazy: true,
+      weak: false,
+      current_version: null,
+      resolution: { status: "resolved", image: "lib/libl.dylib" },
+    });
+    expect(present.findings).toEqual([]);
+    expect(present.coverage.status).toBe("complete");
+    await rm(join(directory, "lib/libl.dylib"));
+    const absent = await trace();
+    expect(lazyEdge(absent)?.resolution).toEqual({
+      status: "unresolved",
+      image: null,
+    });
+    // A missing lazy dylib fails on first use, not at launch.
+    expect(absent.findings.map(({ kind }) => kind)).toEqual([
+      "lazy-load-unresolved",
+    ]);
+    expect(absent.coverage.status).toBe("complete");
   },
 );
 

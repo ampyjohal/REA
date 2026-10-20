@@ -14,6 +14,7 @@ import {
   dylibCommand,
   dylibUseCommand,
   fatImage,
+  lazyLoadDylibInfo,
   machoImage,
   readerOf,
   rpathCommand,
@@ -350,6 +351,98 @@ describe("Mach-O load command reader: decodes thin-image load commands", () => {
         delayed: false,
       },
     ]);
+  });
+});
+
+describe("Mach-O load command reader: decodes LC_LAZY_LOAD_DYLIB_INFO", () => {
+  it("decodes LC_LAZY_LOAD_DYLIB_INFO records in load-command order", async () => {
+    const facts = await read(
+      machoImage({
+        commands: [dylibCommand(LC.LOAD_DYLIB, "/usr/lib/libSystem.B.dylib")],
+        linkedit: [
+          {
+            command: LC.LAZY_LOAD_DYLIB_INFO,
+            data: lazyLoadDylibInfo("@rpath/libl.dylib"),
+          },
+          {
+            command: LC.LAZY_LOAD_DYLIB_INFO,
+            data: lazyLoadDylibInfo("@rpath/libmaybe.dylib", {
+              flags: 0x1,
+              symbols: ["_a", "_b"],
+            }),
+          },
+        ],
+      }),
+    );
+    if (facts.status !== "parsed") throw new Error(facts.status);
+    expect(facts.slices[0]?.dependencies.slice(1)).toEqual([
+      {
+        command: "LC_LAZY_LOAD_DYLIB_INFO",
+        encoding: "lazy_load_dylib_info",
+        install_name: "@rpath/libl.dylib",
+        weak: false,
+        upward: false,
+        reexport: false,
+        delayed_init: false,
+        lazy: true,
+        current_version: null,
+        compatibility_version: null,
+      },
+      expect.objectContaining({
+        install_name: "@rpath/libmaybe.dylib",
+        weak: true,
+        lazy: true,
+      }),
+    ]);
+  });
+
+  it("rejects LC_LAZY_LOAD_DYLIB_INFO data that dyld would reject", async () => {
+    const withData = (data: Uint8Array) =>
+      read(
+        machoImage({
+          linkedit: [{ command: LC.LAZY_LOAD_DYLIB_INFO, data }],
+        }),
+      );
+    const valid = lazyLoadDylibInfo("@rpath/libl.dylib");
+    const patched = (offset: number, value: number) => {
+      const bytes = valid.slice();
+      new DataView(bytes.buffer).setUint32(offset, value, true);
+      return bytes;
+    };
+    await expect(withData(valid.subarray(0, 20))).resolves.toEqual({
+      status: "malformed",
+      reason:
+        "load command 0 LC_LAZY_LOAD_DYLIB_INFO data is too short for its header",
+    });
+    await expect(withData(patched(0, valid.length))).resolves.toMatchObject({
+      status: "malformed",
+      reason: expect.stringContaining("path offset"),
+    });
+    await expect(withData(patched(16, 1000))).resolves.toMatchObject({
+      status: "malformed",
+      reason: expect.stringContaining("symbol table exceeds its data"),
+    });
+    await expect(
+      withData(patched(24, valid.length + 1)),
+    ).resolves.toMatchObject({
+      status: "malformed",
+      reason: expect.stringContaining("symbol 0 is outside its data"),
+    });
+    const unterminated = valid.slice();
+    unterminated.fill(0x41, 28);
+    await expect(withData(unterminated)).resolves.toMatchObject({
+      status: "malformed",
+      reason: "load command 0 has an unterminated string",
+    });
+    const beyond = machoImage({
+      linkedit: [{ command: LC.LAZY_LOAD_DYLIB_INFO, data: valid }],
+    });
+    await expect(
+      readMachoImage(readerOf(beyond), beyond.length - 1),
+    ).resolves.toMatchObject({
+      status: "malformed",
+      reason: expect.stringContaining("data extends beyond the Mach-O slice"),
+    });
   });
 });
 

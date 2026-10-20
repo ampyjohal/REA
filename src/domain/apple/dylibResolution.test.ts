@@ -47,6 +47,7 @@ const dependency = (
   upward: false,
   reexport: false,
   delayed_init: false,
+  lazy: overrides.command === "LC_LAZY_LOAD_DYLIB",
   current_version: "1.0.0",
   compatibility_version: "1.0.0",
   ...overrides,
