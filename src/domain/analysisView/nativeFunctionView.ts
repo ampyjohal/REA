@@ -89,14 +89,56 @@ const nativeRows = (
   }[facet];
 };
 
+/** Compact dossier summary: identity, pseudocode size, facet counts and value-flow availability. */
+const summarizeDossier = (dossier: FunctionDossier) => {
+  const sourceFlow = dossier.native_value_flow;
+  const flow = sourceFlow?.available ? sourceFlow : undefined;
+  return {
+    procedure: {
+      name: dossier.procedure.name,
+      address: dossier.procedure.address,
+    },
+    pseudocode: {
+      available:
+        dossier.facet_availability?.pseudocode?.available ??
+        dossier.pseudocode.length > 0,
+      code_units: dossier.pseudocode.length,
+    },
+    value_flow: {
+      available: flow !== undefined,
+      truncated: flow?.truncated ?? false,
+    },
+    counts: {
+      assembly: dossier.assembly.length,
+      basic_blocks: dossier.basic_blocks.length,
+      comments: dossier.comments.length,
+      callers: dossier.callers.length,
+      callees: dossier.callees.length,
+      incoming_references: dossier.incoming_references.length,
+      outgoing_references: dossier.outgoing_references.length,
+      unresolved_calls: (dossier.unresolved_calls ?? []).length,
+      referenced_strings: dossier.referenced_strings.length,
+      referenced_names: dossier.referenced_names.length,
+      value_flow_operations: flow?.operations.length ?? 0,
+      value_flow_def_use: flow?.def_use.length ?? 0,
+      value_flow_effects: flow?.effects.length ?? 0,
+      value_flow_parameters: flow?.parameters.length ?? 0,
+      value_flow_parameter_uses: flow?.parameter_uses.length ?? 0,
+    },
+    limitation_count: dossier.limitations.length,
+  };
+};
+
 /** Project bounded native function facets from complete retained Evidence without reanalysis. */
 export const projectNativeFunctionView = (
   parent: AnalysisViewParent,
   dossier: FunctionDossier,
   view: AnalysisViewRequest,
 ): Result<UnsignedAnalysisView, AnalysisError> => {
-  if (view.kind !== "native")
-    return err(viewError("analyze_function Evidence requires a native view."));
+  if (view.kind !== "native" && view.kind !== "summary")
+    return err(
+      viewError("analyze_function Evidence requires a native or summary view."),
+    );
   const artifact = parent.artifact;
   if (!artifact)
     return err(
@@ -110,6 +152,14 @@ export const projectNativeFunctionView = (
       ]),
     );
   const common = parentFields(parent, dossier, artifact);
+  if (view.kind === "summary")
+    return ok({
+      kind: "summary",
+      view,
+      summary: summarizeDossier(dossier),
+      coverage: completeWithinViewCoverage(1, 1),
+      ...common,
+    });
   const availabilityKeys: Readonly<Record<string, string>> = {
     incoming_references: "references",
     outgoing_references: "references",

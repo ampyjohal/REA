@@ -30,6 +30,11 @@ import { logToolExecution } from "./toolLogging.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import { executeFunctionAnalysisEvidence } from "../application/FunctionAnalysisEvidence.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
+import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
+import {
+  requireAnalysisViewRetention,
+  summarizeRetainedAnalysis,
+} from "../application/analysisView/AnalysisViewService.js";
 
 /** Optional session services used by enhanced tool registration. */
 export interface EnhancedToolRegistration {
@@ -42,6 +47,7 @@ export interface EnhancedToolRegistration {
       ) => AnalysisProfileCommitment | undefined)
     | undefined;
   readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
+  readonly evidenceById?: EvidenceLookup | undefined;
   readonly recordUnknown: UnknownRegistryPort["recordUnknown"] | undefined;
   readonly allowsSnapshotReplay:
     | ((operation: ValidatedEnhancedCall["name"]) => boolean)
@@ -320,6 +326,16 @@ const executeFunctionTool = async (
 ): Promise<CallToolResult> => {
   const { context, parameters } = request;
   const progress = mcpProgressReporter(context);
+  const retention = {
+    recordEvidence: registration.recordEvidence,
+    evidenceById: registration.evidenceById,
+  };
+  // Fail before analysis when a retained summary cannot keep its complete source.
+  if (parameters.detail === "summary") {
+    const ready = requireAnalysisViewRetention("analyze_function", retention);
+    if (!ready.ok)
+      return registration.delivery.toCallToolResult(ready, contract);
+  }
   const result = await logToolExecution(
     registration.logger,
     "analyze_function",
@@ -343,6 +359,16 @@ const executeFunctionTool = async (
   });
   if (!result.ok)
     return registration.delivery.toCallToolResult(result, contract);
+  if (parameters.detail === "summary") {
+    const summary = summarizeRetainedAnalysis(result.value, retention);
+    if (!summary.ok)
+      return registration.delivery.toCallToolResult(summary, contract);
+    return registration.delivery.toEvidenceToolResult(
+      summary.value,
+      contract,
+      registration.recordEvidence?.(summary.value),
+    );
+  }
   return registration.delivery.toEvidenceToolResult(
     result.value,
     contract,

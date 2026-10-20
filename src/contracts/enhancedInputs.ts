@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { nativeValueTraceInputSchema } from "../domain/native/nativeValueTrace.js";
+import { analysisDetailSummaryDefaultSchema } from "./analysisDetail.js";
 const traceLiteralInputSchema = z.strictObject({
   query: z.string().min(1),
   case_sensitive: z.boolean().default(false),
@@ -52,6 +53,7 @@ export const enhancedInputSchemas = {
   binary_overview: z.strictObject({}),
   analyze_function: z.strictObject({
     procedure: z.string().describe("A procedure name or address"),
+    detail: analysisDetailSummaryDefaultSchema,
   }),
   inspect_native_api: z.strictObject({
     procedure: z.string().describe("A procedure name or address"),

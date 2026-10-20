@@ -29,6 +29,7 @@ import { sourceMapReference } from "../javascript/javascriptApplicationGraph.fix
 import { createArtifactInspection } from "../artifactInspection.js";
 import { javascriptModulePath } from "./javascriptApplicationView.js";
 import {
+  analysisViewResultSchema,
   inspectAnalysisViewInputSchema,
   projectAnalysisView,
   type AnalysisViewParent,
@@ -98,6 +99,25 @@ it("projects native procedure and bounded assembly and high-pcode with exact par
   });
   if (!flow.ok) throw flow.error;
   expect(flow.value).toMatchObject({ item: [{ opcode: "COPY" }] });
+});
+
+it("projects a compact analyze_function summary that validates and retains the dossier", () => {
+  const parent = nativeParent();
+  const summary = projectAnalysisView(parent, { kind: "summary" });
+  if (!summary.ok) throw summary.error;
+  const validated = analysisViewResultSchema.parse(summary.value);
+  expect(validated).toMatchObject({
+    kind: "summary",
+    parent_operation: "analyze_function",
+    parent_evidence_id: parent.evidenceId,
+    artifact: parent.artifact,
+    summary: {
+      procedure: { address: "0x401000" },
+      pseudocode: { available: true },
+      value_flow: { available: true },
+      counts: { assembly: 2 },
+    },
+  });
 });
 
 it("rejects invalid native parents, unsupported source operations and singleton offsets", () => {

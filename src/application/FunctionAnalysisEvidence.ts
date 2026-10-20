@@ -28,7 +28,9 @@ export const executeFunctionAnalysisEvidence = async (
         { cause: input.error },
       ),
     );
-  const arguments_ = jsonObjectSchema.parse(input.data);
+  // Delivery detail selects a response shape; it never reaches the provider or Evidence identity.
+  const { detail: _detail, ...delivered } = input.data;
+  const arguments_ = jsonObjectSchema.parse(delivered);
   const execution = await analysis.execute(
     "analyze_function",
     arguments_,
