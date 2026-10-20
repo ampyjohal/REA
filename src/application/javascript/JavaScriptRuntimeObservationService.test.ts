@@ -14,6 +14,11 @@ import {
   listJavaScriptRuntimeTargets,
   observeJavaScriptRuntime,
 } from "./JavaScriptRuntimeObservationService.js";
+import {
+  expectDroppedPartial,
+  expectKeptPartial,
+  expectOwnerError,
+} from "../ownerObservationExpectation.fixture.js";
 
 it("preserves failed Inspector cleanup when cancellation occurs during observation", async () => {
   const controller = new AbortController();
@@ -315,5 +320,52 @@ it.each(["list", "observe"] as const)(
       expect(result.error.cause).toBe(reason);
     }
     expect(providerCalls).toBe(0);
+  },
+);
+
+it("keeps cancellation when the retained runtime observation is incomplete", async () => {
+  const reason = { requested: "stop before runtime observation completed" };
+  const partial = { runtime: "partial", scripts: [] };
+  const failure = new AnalysisCancelledError("observe_javascript_runtime", {
+    cause: reason,
+    partialObservation: partial as never,
+  });
+  const provider: JavaScriptRuntimeObservationPort = {
+    identity: () => ({ id: "test", name: "Test", version: "1" }),
+    listTargets: async () =>
+      err(new AnalysisCancelledError("list_javascript_runtime_targets")),
+    observe: async () => err(failure),
+  };
+  const result = await observeJavaScriptRuntime(provider, {
+    inspector_endpoint: "http://127.0.0.1:9229",
+    target_id: "target",
+    observation_ms: 0,
+  });
+  expectKeptPartial(expectOwnerError(result, failure, reason), partial);
+});
+
+it.each([{ scripts: [undefined] }, { elapsed_ms: Number.NaN }])(
+  "drops a non-JSON runtime partial and keeps cancellation primary",
+  async (partial) => {
+    const reason = { requested: "stop before runtime observation completed" };
+    const failure = new AnalysisCancelledError("observe_javascript_runtime", {
+      cause: reason,
+      partialObservation: partial as never,
+    });
+    const provider: JavaScriptRuntimeObservationPort = {
+      identity: () => ({ id: "test", name: "Test", version: "1" }),
+      listTargets: async () =>
+        err(new AnalysisCancelledError("list_javascript_runtime_targets")),
+      observe: async () => err(failure),
+    };
+    const result = await observeJavaScriptRuntime(provider, {
+      inspector_endpoint: "http://127.0.0.1:9229",
+      target_id: "target",
+      observation_ms: 0,
+    });
+    expectDroppedPartial(
+      expectOwnerError(result, failure, reason),
+      "Inspector retained a non-JSON incomplete observation.",
+    );
   },
 );

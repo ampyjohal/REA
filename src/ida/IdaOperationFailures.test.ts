@@ -479,9 +479,10 @@ describe("headless IDA procedure lookup failures", () => {
         expect(projected.category, "the category is invalid_input").toBe(
           "invalid_input",
         );
-        expect(projected.retryable, "the caller can correct and retry").toBe(
-          true,
-        );
+        expect(
+          projected.retryable,
+          "an unchanged invalid procedure is not retried",
+        ).toBe(false);
         expect(
           projected.details,
           "the operation and exactly one issue that names the procedure in its message",

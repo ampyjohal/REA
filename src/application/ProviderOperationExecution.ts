@@ -6,8 +6,10 @@ import type {
 import {
   AnalysisCancelledError,
   AnalysisInputError,
+  AnalysisOutputError,
 } from "../domain/analysisErrorCore.js";
 import type { Evidence } from "../domain/evidence.js";
+import { jsonValueValidationIssue } from "../domain/jsonValue.js";
 import { projectInputIssues } from "../domain/inputIssueProjection.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
@@ -91,4 +93,24 @@ export const completeProviderEvidence = (
       }),
     );
   return ok(evidence);
+};
+
+/**
+ * Retain an incomplete observation when projection can serialize it.
+ * A partial that is not JSON is cleared and recorded as a secondary
+ * output failure, leaving cancellation or timeout as the owner error.
+ */
+export const keepIncompleteObservation = (
+  error: AnalysisError,
+  operation: string,
+  reason: string,
+): AnalysisError => {
+  const partial = error.partialObservation;
+  // Validate without cloning. Projection serializes a kept partial later.
+  if (partial === undefined || jsonValueValidationIssue(partial) === undefined)
+    return error;
+  error.partialObservation = undefined;
+  return error.retainSecondaryFailure(
+    new AnalysisOutputError(operation, reason),
+  );
 };
