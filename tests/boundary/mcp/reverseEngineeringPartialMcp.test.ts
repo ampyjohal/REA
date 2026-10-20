@@ -5,7 +5,12 @@ import { dirname, join } from "node:path";
 import { expect, it, vi } from "vitest";
 
 import { TestReverseEngineeringService as ReverseEngineeringService } from "../../support/reverseEngineeringService.js";
-import { AnalysisInputError } from "../../../src/domain/analysisErrorCore.js";
+import {
+  AnalysisInputError,
+  AnalysisOutputError,
+} from "../../../src/domain/analysisErrorCore.js";
+import type { AnalysisError } from "../../../src/domain/analysisErrorBase.js";
+import type { Evidence } from "../../../src/domain/evidence.js";
 import {
   createBinarySessionTargets,
   createCacheProvider,
@@ -14,6 +19,7 @@ import {
 import type { AnalysisOperationPort } from "../../../src/application/AnalysisProvider.js";
 import { EvidenceIntegrityError } from "../../../src/domain/evidenceErrors.js";
 import { err, ok } from "../../../src/domain/result.js";
+import type { Result } from "../../../src/domain/result.js";
 import type { WithAdmittedAnalysis } from "../../../src/server/analysisAdmission.js";
 import { createToolResultDelivery } from "../../../src/server/toolResult.js";
 import { registerReverseEngineeringTools } from "../../../src/server/registerReverseEngineeringTools.js";
@@ -70,11 +76,143 @@ it("records partial Evidence and references it in the original MCP error", async
   });
 });
 
+it("passes retained Rizin cleanup recovery through external mutation admission", async () => {
+  const { server, handler } = createReverseEngineeringMcpHarness();
+  const cleanupFailure = new AnalysisOutputError(
+    "execute_rizin_command",
+    "A prior Rizin process still requires cleanup.",
+    { cleanup: { reason: "provider writer remains", resources: ["process"] } },
+  );
+  const service = new ReverseEngineeringService({
+    run: async () => ({ stdout: "unused", stderr: "" }),
+  });
+  const retryCleanup = vi
+    .spyOn(service, "retryCleanup")
+    .mockResolvedValueOnce(ok(null))
+    .mockResolvedValueOnce(err(cleanupFailure));
+  let recoveryResult: Result<null, AnalysisError> | undefined;
+  const withAdmittedExternalMutation = async <Value>(
+    _path: string | undefined,
+    _signal: AbortSignal | undefined,
+    _operation: (
+      onDispatch?: () => void,
+    ) => Promise<Result<Value, AnalysisError>>,
+    _retirementFailure: (
+      value: Result<Value, AnalysisError>,
+      error: AnalysisError,
+    ) => AnalysisError,
+    cleanupRecovery?: (
+      failure: AnalysisError | undefined,
+    ) => Promise<Result<null, AnalysisError>>,
+  ): Promise<Result<Result<Value, AnalysisError>, AnalysisError>> => {
+    recoveryResult = await cleanupRecovery?.(cleanupFailure);
+    return err(cleanupFailure);
+  };
+  registerReverseEngineeringTools(
+    server,
+    service,
+    pino({ enabled: false }),
+    createToolResultDelivery(2 * 1024 * 1024),
+    undefined,
+    undefined,
+    undefined,
+    withAdmittedExternalMutation,
+  );
+
+  const response = (await invokeWithLiveSignal(
+    handler("execute_rizin_command"),
+    { path: "package.json", command: "iI" },
+  )) as { readonly isError?: boolean };
+
+  expect(response.isError).toBe(true);
+  expect(retryCleanup).toHaveBeenNthCalledWith(1, "execute_rizin_command");
+  expect(retryCleanup).toHaveBeenNthCalledWith(2, "execute_rizin_command");
+  expect(recoveryResult).toEqual(err(cleanupFailure));
+});
+
+it.each(["missing", "directory"])(
+  "preserves session replay when Rizin rejects a %s artifact before dispatch",
+  async (kind) => {
+    const [target] = await createBinarySessionTargets();
+    const calls: string[] = [];
+    const session = createTestBinarySession(createCacheProvider(calls));
+    const run = vi.fn(async () => ({ stdout: "must not launch", stderr: "" }));
+    const service = new ReverseEngineeringService({ run });
+    const { server, handler } = createReverseEngineeringMcpHarness();
+    registerReverseEngineeringTools(
+      server,
+      service,
+      pino({ enabled: false }),
+      createToolResultDelivery(2 * 1024 * 1024),
+      undefined,
+      undefined,
+      undefined,
+      (path, signal, operation, failure) =>
+        session.withAdmittedExternalMutation(
+          path,
+          signal,
+          operation,
+          failure,
+          "execute_rizin_command",
+          undefined,
+          "provider-dispatch",
+        ),
+    );
+    try {
+      expect((await session.open(target)).ok).toBe(true);
+      expect(
+        (
+          await session.execute("address_name", {
+            address: "0x1000",
+            document: "first",
+          })
+        ).ok,
+      ).toBe(true);
+      const captured = session.exportAnalysisSnapshot();
+      if (!captured.ok) throw captured.error;
+      expect(captured.value.entries).toHaveLength(1);
+      await session.close();
+      expect(
+        (await session.open(target, { snapshot: captured.value })).ok,
+      ).toBe(true);
+      calls.length = 0;
+      const before = session.exportAnalysisSnapshot();
+      const response = (await invokeWithLiveSignal(
+        handler("execute_rizin_command"),
+        {
+          path:
+            kind === "missing"
+              ? join(dirname(target), "missing")
+              : dirname(target),
+          command: "iI",
+        },
+      )) as { isError?: boolean };
+      expect(response.isError).toBe(true);
+      expect(run).not.toHaveBeenCalled();
+      expect(session.activeTarget()?.path).toBe(target);
+      expect(session.exportAnalysisSnapshot()).toEqual(before);
+      expect(
+        (
+          await session.execute("address_name", {
+            address: "0x1000",
+            document: "first",
+          })
+        ).ok,
+      ).toBe(true);
+      expect(calls).toEqual([]);
+    } finally {
+      await service.close();
+      await session.close();
+    }
+  },
+);
+
 it("admits Rizin mutation after invalidating before dispatch", async () => {
   const { server, handler } = createReverseEngineeringMcpHarness();
   const events: string[] = [];
   const service = new ReverseEngineeringService({
-    run: async () => {
+    run: async (_command, _arguments, options) => {
+      options?.onDispatch?.();
       events.push("dispatch");
       return { stdout: "rizin output", stderr: "" };
     },
@@ -106,7 +244,10 @@ it("invalidates the snapshot in the legacy Rizin admission path", async () => {
   const { server, handler } = createReverseEngineeringMcpHarness();
   const invalidateSnapshot = vi.fn();
   const service = new ReverseEngineeringService({
-    run: async () => ({ stdout: "rizin output", stderr: "" }),
+    run: async (_command, _arguments, options) => {
+      options?.onDispatch?.();
+      return { stdout: "rizin output", stderr: "" };
+    },
   });
   registerReverseEngineeringTools(
     server,
@@ -236,7 +377,7 @@ it("preserves the Rizin operation error when analysis retirement also fails", as
   });
 });
 
-it.each(["success", "timeout"])(
+it.skipIf(process.platform === "win32").each(["success", "timeout"])(
   "retains %s output and requires reopening after a symlink command",
   async (outcome) => {
     const [target] = await createBinarySessionTargets();
@@ -249,7 +390,8 @@ it.each(["success", "timeout"])(
 
     const { server, handler } = createReverseEngineeringMcpHarness();
     const service = new ReverseEngineeringService({
-      run: async () => {
+      run: async (_command, _arguments, options) => {
+        options?.onDispatch?.();
         await writeFile(alias, "changed by Rizin");
         if (outcome === "timeout")
           throw Object.assign(new Error("timed out"), {
@@ -270,13 +412,16 @@ it.each(["success", "timeout"])(
       createToolResultDelivery(2 * 1024 * 1024),
       recordEvidence,
       undefined,
-      () => session.invalidateSnapshotForExternalMutation(),
+      undefined,
       (path, signal, operation, rebindFailure) =>
         session.withAdmittedExternalMutation(
           path,
           signal,
           operation,
           rebindFailure,
+          "execute_rizin_command",
+          undefined,
+          "provider-dispatch",
         ),
     );
     const invoke = handler("execute_rizin_command");

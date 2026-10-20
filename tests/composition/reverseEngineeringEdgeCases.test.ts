@@ -25,6 +25,55 @@ import { REVERSE_ENGINEERING_TOOL_CONTRACTS } from "../../src/contracts/reverseE
 registerSharedReverseEngineeringEdgeCaseTests();
 registerOwnedRizinCommandEvidenceTests({ sweepTokenOwnedProcesses: true });
 
+it("preserves guidance when the host cannot enforce requested descendant ownership", async () => {
+  const service = new CoreReverseEngineeringService({
+    commands: createReverseEngineeringCommandPort({}),
+    runOwned: async () => {
+      throw Object.assign(
+        new Error(
+          "Token-owned process cleanup requires a host ownership baseline; use Linux or macOS.",
+        ),
+        { code: "ERR_PROCESS_OWNERSHIP_UNAVAILABLE" },
+      );
+    },
+  });
+  try {
+    expect(
+      await service.inspectWithObjdump({ operation: "architectures" }),
+    ).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisCapabilityUnavailableError",
+        reason: expect.stringContaining("host ownership baseline"),
+      },
+    });
+  } finally {
+    await service.close();
+  }
+});
+
+it("preserves a direct process ownership preparation capability failure", async () => {
+  const remediation = new AnalysisCapabilityUnavailableError(
+    "process-ownership",
+    "prepare_owned_process",
+    "Install a procps-compatible ps on REA's PATH.",
+    { userMessage: "Install procps." },
+  );
+  const service = new CoreReverseEngineeringService({
+    commands: createReverseEngineeringCommandPort({}),
+    runOwned: async () => {
+      throw remediation;
+    },
+  });
+  try {
+    expect(
+      await service.inspectWithObjdump({ operation: "architectures" }),
+    ).toEqual({ ok: false, error: remediation });
+  } finally {
+    await service.close();
+  }
+});
+
 it("records pathless objdump architecture support as provider capability evidence", async () => {
   const { directory, path } = await createArtifact();
   expect(objdumpCommand({ operation: "architectures" })).toEqual(["-i"]);
@@ -263,20 +312,19 @@ it("cancels an artifact stream when cancellation races with its listener registr
 
 it("cancels before stream listeners when the signal changes after stat", async () => {
   const { directory, path } = await createArtifact();
-  let abortedReads = 0;
-  const signal = {
-    get aborted() {
-      abortedReads += 1;
-      return abortedReads >= 5;
-    },
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => true,
-    onabort: null,
-    reason: undefined,
-    throwIfAborted: () => {},
-  } as AbortSignal;
-  const stat = vi.fn(async () => ({ isFile: () => true }) as unknown as Stats);
+  // Tie cancellation to the metadata boundary instead of counting unrelated
+  // reads of signal.aborted in admission and provider resolution.
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const stat = vi.fn(
+    async () =>
+      ({
+        isFile: () => {
+          controller.abort();
+          return true;
+        },
+      }) as unknown as Stats,
+  );
   const run = vi.fn(async () => ({ stdout: "", stderr: "" }));
   const service = new ReverseEngineeringService({ stat, run });
 
@@ -290,8 +338,6 @@ it("cancels before stream listeners when the signal changes after stat", async (
       ok: false,
       error: { _tag: "AnalysisCancelledError" },
     });
-    // Cancellation checks may be repeated by the digest cleanup path.
-    expect(abortedReads).toBeGreaterThanOrEqual(5);
     expect(stat).toHaveBeenCalledTimes(1);
     expect(run).not.toHaveBeenCalled();
   } finally {
@@ -848,7 +894,7 @@ it("preserves a provider timeout when cancellation arrives during the final dige
           stderr: "timeout diagnostic",
         },
         partialObservation: {
-          raw_result: {
+          normalized_result: {
             stdout: "partial timeout output",
             completion_status: "unknown",
           },
@@ -945,7 +991,7 @@ it("preserves completed command Evidence while its post-run digest awaits cleanu
       error: {
         _tag: "AnalysisOutputError",
         partialObservation: {
-          raw_result: {
+          normalized_result: {
             exit_code: 0,
             completion_status: "complete",
             artifact_sha256_after: null,
@@ -983,7 +1029,7 @@ it("records an explicit loss marker when provider bytes are invalid UTF-8", asyn
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value).toMatchObject({
-        raw_result: { stdout: "captured � output" },
+        normalized_result: { stdout: "captured � output" },
       });
       expect(result.value.limitations).toContain(
         "Captured stdout bytes contain invalid or incomplete UTF-8; replacement characters in the text capture do not preserve the original bytes.",

@@ -209,10 +209,16 @@ describe("provider process output and cleanup primitives", () => {
     });
 
     await expect(supervisor.waitForOutputClose(2_000)).resolves.toBe(true);
-    expect(supervisor.snapshot()).toMatchObject({
-      stdout: { text: "a�b", invalidUtf8: true },
-      stderr: { text: "c�d", invalidUtf8: true },
-    });
+    const decode = vi.spyOn(TextDecoder.prototype, "decode");
+    try {
+      expect(supervisor.snapshot()).toMatchObject({
+        stdout: { text: "a�b", invalidUtf8: true },
+        stderr: { text: "c�d", invalidUtf8: true },
+      });
+      expect(decode).not.toHaveBeenCalled();
+    } finally {
+      decode.mockRestore();
+    }
     await expect(supervisor.stop()).resolves.toMatchObject({
       status: "already-exited",
     });
@@ -494,6 +500,35 @@ describe("provider process host injection", () => {
         );
     }
   });
+
+  it("refuses a required token sweep when the host cannot capture ownership", async () => {
+    const host = systemProcessOwnershipHost as {
+      captureBaseline?: (signal?: AbortSignal) => Promise<unknown>;
+    };
+    const baseline = host.captureBaseline;
+    let dispatched = false;
+    delete host.captureBaseline;
+    try {
+      await expect(
+        spawnOwnedProviderProcess({
+          command: process.execPath,
+          arguments: [processFixturePath, "exit"],
+          runId: "provider-process-android-run",
+          platform: "android",
+          sweepTokenOwnedProcesses: true,
+          onDispatch: () => {
+            dispatched = true;
+          },
+        }),
+      ).rejects.toThrow(
+        "Token-owned process cleanup requires a host ownership baseline",
+      );
+      expect(dispatched).toBe(false);
+    } finally {
+      if (baseline === undefined) delete host.captureBaseline;
+      else host.captureBaseline = baseline;
+    }
+  });
 });
 
 describe("provider process memory limits", () => {
@@ -559,12 +594,17 @@ describe("provider startup cancellation", () => {
 describe("provider process spawning primitives", () => {
   it("spawns an owned process group with exact identity coordinates", async () => {
     const runId = "provider-process-run";
+    let dispatches = 0;
     const spawned = await spawnOwnedProviderProcess({
       command: process.execPath,
       arguments: [processFixturePath, "graceful"],
       runId,
+      onDispatch: () => {
+        dispatches += 1;
+      },
     });
     try {
+      expect(dispatches).toBe(1);
       expect(spawned.ownership).toMatchObject({
         runId,
         leaderPid: spawned.process.pid,

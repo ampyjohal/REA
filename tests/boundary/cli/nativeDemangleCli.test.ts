@@ -1,10 +1,15 @@
 import { copyFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { describe, expect } from "vitest";
+import { describe, expect, vi } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
+
+// The rejection case carries a 60 s per-invocation child budget, so the file
+// needs a wider Vitest deadline than the 30 s root default: 90 s leaves the
+// child budget reachable and still provides slack for a loaded runner.
+vi.setConfig({ testTimeout: 90_000 });
 
 const environment = {
   REA_LOG_LEVEL: "silent",
@@ -58,7 +63,9 @@ describe("Swift demangling CLI with line-terminator characters", () => {
         "--json",
       ],
       environment,
-      timeoutMs: 20_000,
+      // One CLI spawn: a loaded macOS runner exceeded 20 s here while the same
+      // invocation takes about a second on an idle host.
+      timeoutMs: 60_000,
     });
     expect(result.signal).toBeNull();
     expect(result.exitCode).toBe(1);

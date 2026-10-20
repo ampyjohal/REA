@@ -29,6 +29,14 @@ rea inspect-with-objdump ./program dwarf --follow-debug-links
 
 Captured stdout and stderr are retained up to a 16 MiB combined limit; `output_truncated` marks output beyond that limit.
 
+`execute_rizin_command` reserves `REA_PROCESS_RUN_ID` for owned-process cleanup.
+Rizin and its plugins receive a generated ownership marker instead of any caller
+value; arbitrary plugin environment behavior can therefore differ from a direct
+Rizin invocation. This is a disclosed input override, not an equivalence claim.
+The marker stays intact so cleanup can identify provider descendants. REA does
+not persist the ambient environment merely because the provider inherits it.
+Debugger inferior environment restoration is a separate boundary.
+
 ## GDB
 
 Persistent GDB sessions, including the MCP workflow and one-shot `rea debug-with-gdb` CLI, are available only on Linux. REA verifies a live inferior's output descriptors through `/proc` before detaching it; it does not claim equivalent descriptor verification on macOS. Windows is also unsupported because owned Job Object cleanup can terminate debugger inferiors. On supported Linux hosts, `start_gdb_session`, `gdb_console`, `gdb_session_status`, and `close_gdb_session` manage a persistent GDB/MI session in MCP. The one-shot CLI requires a caller-selected durable TTY: `rea debug-with-gdb --inferior-tty /dev/pts/7 'file ./program'`. The TTY must remain available after GDB exits so a detached inferior can continue writing. MCP starts GDB with `--nx --quiet --interpreter=mi3`, retries initialization with MI2 if MI3 initialization returns an error and cleanup succeeds, waits for its prompt, and disables auto-loading. Pass optional `inferior_tty` to select the terminal that future inferior runs use; REA configures it before the session becomes ready and checks the exact value with GDB/MI. `gdb_session_status` reports the selected path, whether REA still considers the configuration verified, and whether invalid UTF-8 has been observed in MI bytes (`mi_invalid_utf8`) or stderr (`stderr_invalid_utf8`). Commands that can change the inferior TTY or redirect a run revoke that verification permanently for the session, so close retains GDB ownership if a live inferior remains. Closing a session with one live inferior and a verified TTY automatically detaches the target, which can resume execution; MCP clients receive destructive-operation annotations for this behavior. The console remains unrestricted and can run shell commands, change target state, access files, and use network in the REA process user's security context. Raw MI records and console/target/log streams are returned with Evidence; command output is retained up to 16 MiB and explicitly marked when truncated.
@@ -90,3 +98,23 @@ as opaque metadata, without inferring cleanup ownership from it.
 The optional `REA_OBJDUMP_COMMAND`, `REA_GDB_COMMAND`, and `REA_RIZIN_COMMAND` values select executable names or paths; otherwise REA searches `PATH`. Values are passed directly to process spawning, not expanded as shell command lines. Provider versions and capabilities remain unknown until observed from the installed tool and verified in the corresponding real-provider lane.
 
 Provider capture limits are separate from the MCP response budget. A result that fits the provider limit may still exceed the default 10 MiB MCP response budget and return a transport `resource_constraint`. Configure `REA_MCP_MAX_RESPONSE_BYTES` to match a larger client receive buffer when that client supports one; otherwise use retained Evidence/export or complete CLI JSON output. See [MCP response limits](./mcp-contracts.md#tool-results).
+
+One-shot objdump and Rizin commands require token-based descendant ownership on
+Linux and macOS, or Windows Job Object ownership. Hosts without the required
+ownership baseline (including Android/Termux) refuse these commands before launch
+rather than omit descendant cleanup. After incomplete cleanup, another command on
+the same CLI instance retries the retained owner before it can launch a provider.
+Closing an analysis session cannot acknowledge a writer owned by another service;
+that service must confirm cleanup before a new analysis session can open.
+
+On Windows, provider lookup examines the caller-selected `PATH` asynchronously
+under a 120-second startup deadline, observing request cancellation and server
+shutdown. A timed-out lookup reports a failure; select an absolute
+`REA_OBJDUMP_COMMAND` or `REA_RIZIN_COMMAND` to avoid a slow network `PATH` probe.
+
+Fixed analysis sources supplied to an embedded MCP server expose objdump but
+withhold `execute_rizin_command`, because they cannot retire or refresh a binding
+after mutation. Use a session-backed server for unrestricted Rizin commands.
+Session snapshots are invalidated only after provider preparation and artifact
+validation succeed, immediately before attempting dispatch. A missing or
+non-regular artifact preserves the current session and its replay state.

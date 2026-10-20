@@ -157,6 +157,9 @@ export interface LifecycleToolRegistration extends SessionAvailabilityProbes {
   readonly startedAt: string;
   readonly availabilityPolicy: () => AvailabilityPolicy;
   readonly closeProcessResources: () => Promise<Result<null, AnalysisError>>;
+  readonly retryReverseEngineeringCleanup?: (
+    operation: string,
+  ) => Promise<Result<null, AnalysisError>>;
 }
 
 const registerLifecycleTools = (
@@ -172,7 +175,13 @@ const registerLifecycleTools = (
 };
 
 const registerOpenLifecycleTool = (
-  { server, session, logger, openContract }: LifecycleToolRegistration,
+  {
+    server,
+    session,
+    logger,
+    openContract,
+    retryReverseEngineeringCleanup,
+  }: LifecycleToolRegistration,
   artifactResources: ArtifactResourceScope,
 ): void => {
   server.registerTool(
@@ -183,6 +192,14 @@ const registerOpenLifecycleTool = (
       const opened = await logToolExecution(logger, openContract.name, () =>
         session.open(input.path, {
           signal: context.mcpReq.signal,
+          // Retained reverse-engineering owners are settled inside the open
+          // transition, so a later close cannot overtake this open.
+          ...(retryReverseEngineeringCleanup === undefined
+            ? {}
+            : {
+                beforeOpen: () =>
+                  retryReverseEngineeringCleanup(openContract.name),
+              }),
           ...(input.format === undefined ? {} : { formatHint: input.format }),
           ...(input.architecture === undefined
             ? {}
@@ -223,6 +240,9 @@ const registerOpenLifecycleTool = (
 /** Register MCP-only target lifecycle operations on a long-lived session. */
 export interface SessionToolOptions extends Partial<SessionAvailabilityProbes> {
   readonly artifactResources: ArtifactResourceScope;
+  readonly retryReverseEngineeringCleanup?: (
+    operation: string,
+  ) => Promise<Result<null, AnalysisError>>;
   readonly startedAt?: string;
   readonly availabilityPolicy?: () => AvailabilityPolicy;
 }
@@ -305,6 +325,18 @@ export const registerSessionTools = (
       ),
       androidAnalysisAvailability:
         options.androidAnalysisAvailability ?? missingAndroidAvailability,
+      ...(options.retryReverseEngineeringCleanup === undefined
+        ? {}
+        : {
+            retryReverseEngineeringCleanup:
+              options.retryReverseEngineeringCleanup,
+          }),
+      ...(options.adbAnalysisAvailability === undefined
+        ? {}
+        : { adbAnalysisAvailability: options.adbAnalysisAvailability }),
+      ...(options.apktoolAnalysisAvailability === undefined
+        ? {}
+        : { apktoolAnalysisAvailability: options.apktoolAnalysisAvailability }),
       closeProcessResources: async () => {
         try {
           await processResources.retryCleanup();

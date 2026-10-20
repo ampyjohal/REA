@@ -4,6 +4,10 @@ import type {
   RizinInput,
 } from "../../domain/reverseEngineering.js";
 
+/** Capacity refusal emitted before a provider command has been resolved. */
+export const PROVIDER_COMMAND_RESOLUTION_CAPACITY_ERROR_CODE =
+  "EREA_PROVIDER_COMMAND_RESOLUTION_CAPACITY";
+
 /** Provider-neutral command profile consumed by the shared application workflow. */
 export interface ReverseEngineeringProviderCommand {
   readonly executable: string;
@@ -14,6 +18,18 @@ export interface ReverseEngineeringProviderCommand {
 
 /** Provider-specific command construction stays outside the application layer. */
 export interface ReverseEngineeringCommandPort {
-  objdump(input: ObjdumpSelection): ReverseEngineeringProviderCommand;
-  rizin(input: RizinInput): ReverseEngineeringProviderCommand;
+  /** Wait until canceled provider-resolution filesystem probes physically settle. */
+  drainPendingResolution?(): Promise<void>;
+  objdump(
+    input: ObjdumpSelection,
+    options?: { readonly signal?: AbortSignal; readonly cwd?: string },
+  ):
+    | ReverseEngineeringProviderCommand
+    | Promise<ReverseEngineeringProviderCommand>;
+  rizin(
+    input: RizinInput,
+    options?: { readonly signal?: AbortSignal; readonly cwd?: string },
+  ):
+    | ReverseEngineeringProviderCommand
+    | Promise<ReverseEngineeringProviderCommand>;
 }

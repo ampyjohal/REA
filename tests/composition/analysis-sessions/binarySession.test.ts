@@ -4,6 +4,7 @@ import {
   type AnalysisProvider,
 } from "../../../src/application/AnalysisProvider.js";
 import type { BinarySession } from "../../../src/application/binary/BinarySession.js";
+import { readAnalysisSnapshot } from "../../../src/application/binary/AnalysisSnapshotFiles.js";
 import { parseBinaryTarget } from "../../../src/application/BinaryTargetResolver.js";
 import type { JsonValue } from "../../../src/domain/jsonValue.js";
 import type { RecordUnknownInput } from "../../../src/domain/residualUnknown.js";
@@ -24,14 +25,7 @@ import {
   createTestBinarySession,
 } from "../../fixtures/binarySession.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
-import {
-  copyFile,
-  link,
-  mkdir,
-  realpath,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { copyFile, link, mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
@@ -176,7 +170,7 @@ describe("detached provider and target metadata", () => {
 it("drains session calls and retires analysis after an admitted external mutation", async () => {
   const [target] = await createBinarySessionTargets();
   const alias = join(dirname(target), "first-alias.hop");
-  await symlink(target, alias);
+  await link(target, alias);
   const calls: string[] = [];
   const clients: { closed: number; targetSha256: string }[] = [];
   const base = createCacheProvider(calls);
@@ -259,6 +253,67 @@ it("leaves analysis unbound when a command returns before its writer finishes", 
   expect((await session.execute("address_name", {})).ok).toBe(false);
   expect((await session.open(target)).ok).toBe(true);
   expect(session.activeTarget()?.sha256).not.toBe(originalDigest);
+  await session.close();
+});
+
+it.each([false, true])(
+  "close retains an external writer until its owner settles (active: %s)",
+  async (active) => {
+    const [target] = await createBinarySessionTargets();
+    const session = createTestBinarySession(createCacheProvider([]));
+    if (active) expect((await session.open(target)).ok).toBe(true);
+    const failure = new ProviderCleanupError("rizin", ["owned-debugger"], {
+      reason: "writer still live",
+    });
+    await session.withAdmittedExternalMutation(
+      target,
+      undefined,
+      async () => err(failure),
+      (_value, error) => error,
+    );
+    expect(await session.close()).toEqual(err(failure));
+    expect(await session.open(target)).toEqual(err(failure));
+    const mutate = vi.fn(async () => resultOk("must not run"));
+    expect(
+      await session.withAdmittedExternalMutation(
+        target,
+        undefined,
+        mutate,
+        (_value, error) => error,
+      ),
+    ).toEqual(err(failure));
+    expect(mutate).not.toHaveBeenCalled();
+    failure.resolveCleanup();
+    expect((await session.close()).ok).toBe(true);
+    expect((await session.open(target)).ok).toBe(true);
+    await session.close();
+  },
+);
+
+it("lets a retried open resolve a retained external-mutation cleanup failure", async () => {
+  const [target] = await createBinarySessionTargets();
+  const session = createTestBinarySession(createCacheProvider([]));
+  expect((await session.open(target)).ok).toBe(true);
+  const retained = new ProviderCleanupError("rizin", ["owned-rizin"], {
+    reason: "descendant still live",
+  });
+  await session.withAdmittedExternalMutation(
+    target,
+    undefined,
+    async () => err(retained),
+    (_value, error) => error,
+  );
+  expect(retained.cleanupIncomplete).toBe(true);
+  expect((await session.open(target)).ok).toBe(false);
+
+  const reopened = await session.open(target, {
+    beforeOpen: async () => {
+      retained.resolveCleanup();
+      return resultOk(null);
+    },
+  });
+
+  expect(reopened.ok).toBe(true);
   await session.close();
 });
 
@@ -414,6 +469,56 @@ it("keeps an externally mutated session unbound until cleanup is retried", async
   await session.close();
 });
 
+it("retains external-writer cleanup failure alongside analysis-client close failure", async () => {
+  const [target] = await createBinarySessionTargets();
+  const writerFailure = new ProviderCleanupError("rizin", ["debugger-writer"], {
+    reason: "writer still owns the target",
+  });
+  const clientFailure = new ProviderCleanupError(
+    "fixture",
+    ["analysis-client"],
+    { reason: "analysis client cleanup is pending" },
+  );
+  let closeAttempts = 0;
+  const session = createTestBinarySession(() => ({
+    execute: () => Promise.resolve(ok(null)),
+    close: () =>
+      Promise.resolve(
+        ++closeAttempts === 1 ? err(clientFailure) : resultOk(null),
+      ),
+  }));
+  expect((await session.open(target)).ok).toBe(true);
+
+  const result = await session.withAdmittedExternalMutation(
+    target,
+    undefined,
+    async () => err(writerFailure),
+    (_value, error) => error,
+  );
+
+  expect(result).toMatchObject({
+    ok: false,
+    error: {
+      cause: expect.objectContaining({
+        errors: [clientFailure, writerFailure],
+      }),
+    },
+  });
+  if (result.ok)
+    throw new Error("Expected both cleanup owners to remain pending");
+  const aggregate = result.error;
+  expect(aggregate.cleanupIncomplete).toBe(true);
+  expect(aggregate.cleanupResources).toEqual([
+    "analysis-client",
+    "debugger-writer",
+  ]);
+  clientFailure.resolveCleanup();
+  writerFailure.resolveCleanup();
+  expect(aggregate.cleanupIncomplete).toBe(false);
+  expect(aggregate.cleanupResources).toEqual([]);
+  expect((await session.close()).ok).toBe(true);
+});
+
 describe("opening previewed targets", () => {
   it("rechecks the active target after another serialized transition", async () => {
     const [first, second] = await createBinarySessionTargets();
@@ -510,6 +615,58 @@ describe("fresh run identity", () => {
     expect(runIds).toHaveLength(2);
     expect(new Set(runIds).size).toBe(2);
     await session.close();
+  });
+});
+
+describe("open snapshot loading and cleanup recovery", () => {
+  it("loads a snapshot only after the in-turn cleanup recovery completes", async () => {
+    const [target] = await createBinarySessionTargets();
+    const beforeSource = createTestBinarySession(createCacheProvider([]));
+    const afterSource = createTestBinarySession(createCacheProvider([]));
+    const session = createTestBinarySession(createCacheProvider([]));
+    try {
+      await openAndExecuteAddressName(beforeSource, target, {
+        address: "0x1000",
+        document: "snapshot before cleanup recovery",
+      });
+      await openAndExecuteAddressName(afterSource, target, {
+        address: "0x1000",
+        document: "snapshot after cleanup recovery",
+      });
+      const before = beforeSource.exportAnalysisSnapshot();
+      const after = afterSource.exportAnalysisSnapshot();
+      if (!before.ok) throw before.error;
+      if (!after.ok) throw after.error;
+
+      const snapshotPath = join(
+        await createTestTempDirectory("rea-open-snapshot-recovery-"),
+        "analysis.json",
+      );
+      await writeFile(snapshotPath, JSON.stringify(before.value));
+      const events: string[] = [];
+      const opened = await session.open(target, {
+        beforeOpen: async () => {
+          events.push("cleanup recovery");
+          await writeFile(snapshotPath, JSON.stringify(after.value));
+          return resultOk(null);
+        },
+        loadSnapshot: async () => {
+          events.push("snapshot load");
+          return readAnalysisSnapshot(snapshotPath);
+        },
+      });
+
+      expect(opened.ok).toBe(true);
+      expect(events).toEqual(["cleanup recovery", "snapshot load"]);
+      expect(session.exportAnalysisSnapshot()).toMatchObject({
+        ok: true,
+        value: { entries: after.value.entries },
+      });
+    } finally {
+      await session.close();
+      await beforeSource.close();
+      await afterSource.close();
+    }
   });
 });
 
@@ -1564,37 +1721,43 @@ describe("selector origin forwarding", () => {
   });
 });
 
-it("blocks analysis rebinding until the external writer cleanup settles", async () => {
-  const [target] = await createBinarySessionTargets();
-  const session = createTestBinarySession(createCacheProvider([]));
-  expect((await session.open(target)).ok).toBe(true);
-  const failure = new ProviderCleanupError("rizin", ["writer"], {
-    reason: "writer remains alive",
-  });
-  const result = await session.withAdmittedExternalMutation(
-    target,
-    undefined,
-    async () => err(failure),
-    (_value, error) => error,
-  );
-  expect(result).toEqual(resultOk(err(failure)));
-  expect(session.activeTarget()).toBeUndefined();
-  expect(await session.open(target)).toEqual(err(failure));
-  const anotherMutation = vi.fn(async () => resultOk("unrelated command"));
-  expect(
-    await session.withAdmittedExternalMutation(
+it.each(["admission", "provider-dispatch"] as const)(
+  "blocks analysis rebinding until the external writer cleanup settles (%s)",
+  async (mutationStart) => {
+    const [target] = await createBinarySessionTargets();
+    const session = createTestBinarySession(createCacheProvider([]));
+    expect((await session.open(target)).ok).toBe(true);
+    const failure = new ProviderCleanupError("rizin", ["writer"], {
+      reason: "writer remains alive",
+    });
+    const result = await session.withAdmittedExternalMutation(
       target,
       undefined,
-      anotherMutation,
+      async () => err(failure),
       (_value, error) => error,
-    ),
-  ).toEqual(err(failure));
-  expect(anotherMutation).not.toHaveBeenCalled();
-  // Only the resource owner may acknowledge completed cleanup.
-  failure.resolveCleanup();
-  expect((await session.open(target)).ok).toBe(true);
-  await session.close();
-});
+      "execute_rizin_command",
+      undefined,
+      mutationStart,
+    );
+    expect(result).toEqual(resultOk(err(failure)));
+    expect(session.activeTarget()).toBeUndefined();
+    expect(await session.open(target)).toEqual(err(failure));
+    const anotherMutation = vi.fn(async () => resultOk("unrelated command"));
+    expect(
+      await session.withAdmittedExternalMutation(
+        target,
+        undefined,
+        anotherMutation,
+        (_value, error) => error,
+      ),
+    ).toEqual(err(failure));
+    expect(anotherMutation).not.toHaveBeenCalled();
+    // Only the resource owner may acknowledge completed cleanup.
+    failure.resolveCleanup();
+    expect((await session.open(target)).ok).toBe(true);
+    await session.close();
+  },
+);
 
 it("requires explicit close before an external mutation of an active Ghidra session", async () => {
   const [target] = await createBinarySessionTargets();

@@ -7,6 +7,10 @@ import { expect, it } from "vitest";
 
 import { createProviderEnvironmentMcpHarness } from "../../support/reverseDebuggerMcpTestHelpers.js";
 
+// These fixtures are Node.js scripts with POSIX executable permissions. Windows
+// requires a native executable and does not interpret this script format.
+const itPosix = process.platform === "win32" ? it.skip : it;
+
 const writeProvider = async (path: string, output: string): Promise<void> => {
   await writeFile(
     path,
@@ -44,78 +48,89 @@ const executeRizinCommand = async (
   return response;
 };
 
-it("uses the captured server environment to resolve reverse-engineering providers", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "rea-provider-environment-"));
-  const provider = join(directory, "selected-rizin");
-  const artifact = join(directory, "fixture.bin");
-  await writeFile(artifact, "fixture");
-  await writeProvider(provider, "captured-environment-provider");
+itPosix(
+  "uses the captured server environment to resolve reverse-engineering providers",
+  async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "rea-provider-environment-"),
+    );
+    const provider = join(directory, "selected-rizin");
+    const artifact = join(directory, "fixture.bin");
+    await writeFile(artifact, "fixture");
+    await writeProvider(provider, "captured-environment-provider");
 
-  const { client } = await connectProviderClient({
-    directory,
-    clientName: "reverse-provider-environment",
-    configuredProvider: provider,
-  });
-  const response = await executeRizinCommand(client, artifact);
-  expect(JSON.stringify(response.structuredContent)).toContain(
-    "captured-environment-provider",
-  );
-});
+    const { client } = await connectProviderClient({
+      directory,
+      clientName: "reverse-provider-environment",
+      configuredProvider: provider,
+    });
+    const response = await executeRizinCommand(client, artifact);
+    expect(JSON.stringify(response.structuredContent)).toContain(
+      "captured-environment-provider",
+    );
+  },
+);
 
-it("prefers an explicit provider environment over the captured server environment", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "rea-provider-override-"));
-  const configured = join(directory, "captured-rizin");
-  const override = join(directory, "override-rizin");
-  const artifact = join(directory, "fixture.bin");
-  await writeFile(artifact, "fixture");
-  for (const [path, output] of [
-    [configured, "captured"],
-    [override, "explicit-override"],
-  ] as const) {
-    await writeProvider(path, output);
-  }
-  const { client } = await connectProviderClient({
-    directory,
-    clientName: "reverse-provider-override",
-    configuredProvider: configured,
-    providerEnvironment: { REA_RIZIN_COMMAND: override },
-  });
+itPosix(
+  "prefers an explicit provider environment over the captured server environment",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rea-provider-override-"));
+    const configured = join(directory, "captured-rizin");
+    const override = join(directory, "override-rizin");
+    const artifact = join(directory, "fixture.bin");
+    await writeFile(artifact, "fixture");
+    for (const [path, output] of [
+      [configured, "captured"],
+      [override, "explicit-override"],
+    ] as const) {
+      await writeProvider(path, output);
+    }
+    const { client } = await connectProviderClient({
+      directory,
+      clientName: "reverse-provider-override",
+      configuredProvider: configured,
+      providerEnvironment: { REA_RIZIN_COMMAND: override },
+    });
 
-  const response = await executeRizinCommand(client, artifact);
-  expect(JSON.stringify(response.structuredContent)).toContain(
-    "explicit-override",
-  );
-  expect(JSON.stringify(response.structuredContent)).not.toContain(
-    '"captured"',
-  );
-});
+    const response = await executeRizinCommand(client, artifact);
+    expect(JSON.stringify(response.structuredContent)).toContain(
+      "explicit-override",
+    );
+    expect(JSON.stringify(response.structuredContent)).not.toContain(
+      '"captured"',
+    );
+  },
+);
 
-it("snapshots an explicit provider environment when the server is created", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "rea-provider-snapshot-"));
-  const configured = join(directory, "captured-rizin");
-  const override = join(directory, "explicit-rizin");
-  const artifact = join(directory, "fixture.bin");
-  await writeFile(artifact, "fixture");
-  for (const [path, output] of [
-    [configured, "captured"],
-    [override, "explicit-snapshot"],
-  ] as const) {
-    await writeProvider(path, output);
-  }
-  const providerEnvironment = { REA_RIZIN_COMMAND: override };
-  const { client } = await connectProviderClient({
-    directory,
-    clientName: "reverse-provider-snapshot",
-    configuredProvider: configured,
-    providerEnvironment,
-  });
-  providerEnvironment.REA_RIZIN_COMMAND = configured;
+itPosix(
+  "snapshots an explicit provider environment when the server is created",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rea-provider-snapshot-"));
+    const configured = join(directory, "captured-rizin");
+    const override = join(directory, "explicit-rizin");
+    const artifact = join(directory, "fixture.bin");
+    await writeFile(artifact, "fixture");
+    for (const [path, output] of [
+      [configured, "captured"],
+      [override, "explicit-snapshot"],
+    ] as const) {
+      await writeProvider(path, output);
+    }
+    const providerEnvironment = { REA_RIZIN_COMMAND: override };
+    const { client } = await connectProviderClient({
+      directory,
+      clientName: "reverse-provider-snapshot",
+      configuredProvider: configured,
+      providerEnvironment,
+    });
+    providerEnvironment.REA_RIZIN_COMMAND = configured;
 
-  const response = await executeRizinCommand(client, artifact);
-  expect(JSON.stringify(response.structuredContent)).toContain(
-    "explicit-snapshot",
-  );
-  expect(JSON.stringify(response.structuredContent)).not.toContain(
-    '"captured"',
-  );
-});
+    const response = await executeRizinCommand(client, artifact);
+    expect(JSON.stringify(response.structuredContent)).toContain(
+      "explicit-snapshot",
+    );
+    expect(JSON.stringify(response.structuredContent)).not.toContain(
+      '"captured"',
+    );
+  },
+);

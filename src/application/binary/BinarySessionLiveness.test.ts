@@ -16,6 +16,7 @@ import {
   type ProviderTargetSupport,
 } from "../AnalysisProvider.js";
 import { createAnalysisProfile } from "../../domain/analysisProfile.js";
+import { AnalysisOutputError } from "../../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import type { ProviderOperationHealth } from "../../domain/providerOperationHealth.js";
 import { err, ok } from "../../domain/result.js";
@@ -40,6 +41,40 @@ import { SessionProviderRouter } from "./SessionProviderRouter.js";
  * `operationHealthSnapshot`, the way `HopperClient.operationHealth` reports a
  * recorded process exit.
  */
+describe("BinarySession close with snapshot", () => {
+  it("retains a written snapshot receipt when provider cleanup fails", async () => {
+    const directory = await createTestTempDirectory("rea-close-snapshot-");
+    const snapshotPath = join(directory, "analysis.json");
+    const cleanupFailure = new AnalysisOutputError(
+      "close_binary",
+      "Provider cleanup remains pending.",
+      { cleanup: { reason: "provider still live", resources: ["pid:42"] } },
+    );
+    const { session } = openSession({ closeFailure: cleanupFailure });
+
+    expect((await session.open(process.execPath)).ok).toBe(true);
+    expect((await session.execute("address_name", {})).ok).toBe(true);
+
+    const closed = await session.closeWithSnapshot(snapshotPath, false);
+
+    expect(closed.ok).toBe(false);
+    if (closed.ok) throw new Error("Expected cleanup failure");
+    expect(closed.error).toBe(cleanupFailure);
+    expect(closed.error.cleanupIncomplete).toBe(true);
+    expect(closed.error.cleanupResources).toEqual(["pid:42"]);
+    expect(closed.error.diagnostics).toMatchObject({
+      saved_snapshot: {
+        path: snapshotPath,
+        bytes: expect.any(Number),
+        primitive_entries: expect.any(Number),
+        workflow_entries: expect.any(Number),
+        evidence_records: expect.any(Number),
+      },
+    });
+    expect((await session.close()).ok).toBe(true);
+  });
+});
+
 describe("BinarySession open liveness", () => {
   it("retires a locally blocked owner even when its native health is idle", async () => {
     const { session, deep } = openSession();
@@ -349,6 +384,7 @@ const openSession = (
     operationHealth?: boolean;
     failOperationInitially?: boolean;
     beforeFirstClose?: () => Promise<void>;
+    closeFailure?: AnalysisOutputError;
   } = {},
 ): {
   session: BinarySession;
@@ -383,6 +419,7 @@ const killableDeepProvider = (options: {
   operationHealth?: boolean;
   failOperationInitially?: boolean;
   beforeFirstClose?: () => Promise<void>;
+  closeFailure?: AnalysisOutputError;
 }): {
   provider: AnalysisProviderCandidate;
   created: KillableChild[];
@@ -422,6 +459,7 @@ const killableDeepProvider = (options: {
         firstClient && options.failOperationInitially === true;
       let closeCalled = false;
       let healthCalls = 0;
+      let closeFailure = firstClient ? options.closeFailure : undefined;
       let deadState: "exited" | "unreachable" | "unknown" | "not_started" =
         "exited";
       const client: KillableChild = {
@@ -464,6 +502,11 @@ const killableDeepProvider = (options: {
           closeCalled = true;
           if (firstClient && options.beforeFirstClose !== undefined)
             await options.beforeFirstClose();
+          if (closeFailure !== undefined) {
+            const failure = closeFailure;
+            closeFailure = undefined;
+            return err(failure);
+          }
           return ok(null);
         },
         get closeCalled() {

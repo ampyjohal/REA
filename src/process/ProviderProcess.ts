@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { isUtf8 } from "node:buffer";
 import type { EventEmitter } from "node:events";
 import type { Readable, Writable } from "node:stream";
 
@@ -50,6 +51,8 @@ export interface OwnedProviderProcessSpawnOptions {
   readonly memoryLimitBytes?: number;
   /** Sweep exact run-token descendants during POSIX cleanup. */
   readonly sweepTokenOwnedProcesses?: boolean;
+  /** Notify the caller after ownership preflight and immediately before launch. */
+  readonly onDispatch?: () => void;
   /** Cancels native ownership preparation before provider process creation. */
   readonly signal?: AbortSignal;
 }
@@ -238,16 +241,26 @@ export const spawnOwnedProviderProcess = async (
   await prepareProcessOwnershipInspection(options.signal);
   options.signal?.throwIfAborted();
   const platform = options.platform ?? process.platform;
-  const sweepTokenOwnedProcesses =
+  // A requested sweep is part of the cleanup contract, never an optional
+  // optimization. Hosts without identity baselines must refuse before launch.
+  const requiresTokenSweep =
     options.sweepTokenOwnedProcesses === true && platform !== "win32";
+  const captureOwnershipBaseline = requiresTokenSweep
+    ? systemProcessOwnershipHost.captureBaseline
+    : undefined;
+  if (requiresTokenSweep && captureOwnershipBaseline === undefined)
+    throw Object.assign(
+      new Error(
+        "Token-owned process cleanup requires a host ownership baseline; use a supported Linux or macOS host (or Windows Job Objects).",
+      ),
+      { code: "ERR_PROCESS_OWNERSHIP_UNAVAILABLE" },
+    );
   let captureBaseline: ProcessOwnershipBaseline | undefined;
-  if (sweepTokenOwnedProcesses) {
-    const capture = systemProcessOwnershipHost.captureBaseline;
-    if (capture === undefined)
-      throw new Error("Process ownership baseline is unavailable on this host");
-    captureBaseline = await capture(options.signal);
+  if (captureOwnershipBaseline !== undefined) {
+    captureBaseline = await captureOwnershipBaseline(options.signal);
     options.signal?.throwIfAborted();
   }
+  const sweepTokenOwnedProcesses = captureOwnershipBaseline !== undefined;
   const hostEnvironment = options.hostEnvironment ?? process.env;
   const environment = {
     ...hostEnvironment,
@@ -255,6 +268,7 @@ export const spawnOwnedProviderProcess = async (
     REA_PROCESS_RUN_ID: options.runId,
   };
   if (platform === "win32" && process.platform === "win32") {
+    options.onDispatch?.();
     const child = new WindowsOwnedProcess(
       options.command,
       options.arguments,
@@ -283,6 +297,7 @@ export const spawnOwnedProviderProcess = async (
     throw new Error(
       "Owned process memory limits require the Windows Job Object launcher; no limit can be enforced on this host.",
     );
+  options.onDispatch?.();
   const child = spawn(options.command, [...options.arguments], {
     shell: false,
     windowsHide: true,
@@ -868,17 +883,11 @@ class ProcessOutputCapture {
     observedBytes: number,
   ): ProviderProcessSnapshot["stdout"] {
     const text = buffer.toString("utf8");
-    let invalidUtf8 = false;
-    try {
-      new TextDecoder("utf-8", { fatal: true }).decode(buffer);
-    } catch {
-      invalidUtf8 = true;
-    }
     return {
       text,
       bytes: buffer.byteLength,
       observedBytes,
-      ...(invalidUtf8 ? { invalidUtf8: true } : {}),
+      ...(!isUtf8(buffer) ? { invalidUtf8: true } : {}),
     };
   }
 }

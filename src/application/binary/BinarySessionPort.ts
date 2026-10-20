@@ -1,17 +1,12 @@
 import type { InvestigationRecordPort } from "../investigation/InvestigationRecordPort.js";
-import type { ExecutableFormatHint } from "../../domain/dosCom.js";
-import type {
-  BinaryArchitecture,
-  BinaryTarget,
-} from "../../domain/binaryTargetTypes.js";
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import type { AnalysisSnapshot } from "../../domain/analysisSnapshot.js";
 import type { AnalysisProfileCommitment } from "../../domain/analysisProfile.js";
-import type { AnalysisProviderSelector } from "../../contracts/providerSelection.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { Result } from "../../domain/result.js";
 import type { EvidenceIntegrityError } from "../../domain/evidenceErrors.js";
-import type { AnalysisSnapshotLoader } from "./BinarySessionOpen.js";
+import type { BinarySessionOpenOptions } from "./BinarySessionOpen.js";
 import type { WorkflowSnapshotRecordInput } from "./BinarySessionRecords.js";
 
 import type {
@@ -34,6 +29,12 @@ export interface SavedAnalysisSnapshot {
   readonly evidence_records: number;
 }
 
+/** Cleanup extension runs inside the close transition before final ownership checks. */
+export type BinarySessionCloseOptions = Pick<ExecutionOptions, "progress"> & {
+  readonly retainProviderDocuments?: boolean;
+  readonly afterResourceClose?: () => Promise<void>;
+};
+
 /** Target lifecycle used by CLI and MCP without exposing a concrete provider. */
 export interface BinarySessionPort
   extends AnalysisOperationPort, InvestigationRecordPort {
@@ -53,7 +54,9 @@ export interface BinarySessionPort
   withAdmittedExternalMutation<Value>(
     _path: string | undefined,
     signal: AbortSignal | undefined,
-    operation: () => Promise<Result<Value, AnalysisError>>,
+    operation: (
+      onDispatch: () => void,
+    ) => Promise<Result<Value, AnalysisError>>,
     retirementFailure: (
       value: Result<Value, AnalysisError>,
       error: AnalysisError,
@@ -62,30 +65,20 @@ export interface BinarySessionPort
     cleanupRecovery?: (
       failure: AnalysisError | undefined,
     ) => Promise<Result<null, AnalysisError>>,
+    mutationStart?: "admission" | "provider-dispatch",
   ): Promise<Result<Result<Value, AnalysisError>, AnalysisError>>;
   open(
     path: string,
-    options?: {
-      readonly signal?: AbortSignal;
-      readonly targetKind?: BinaryTarget["kind"];
-      readonly formatHint?: ExecutableFormatHint;
-      readonly architecture?: BinaryArchitecture;
-      readonly entryPoint?: string;
-      readonly snapshot?: AnalysisSnapshot;
-      readonly loadSnapshot?: AnalysisSnapshotLoader;
-      readonly providerId?: AnalysisProviderSelector;
-    },
+    options?: BinarySessionOpenOptions,
   ): Promise<Result<BinaryTarget, AnalysisError>>;
   close(
-    options?: Pick<ExecutionOptions, "progress"> & {
-      readonly retainProviderDocuments?: boolean;
-    },
+    options?: BinarySessionCloseOptions,
   ): Promise<Result<null, AnalysisError>>;
   /** Save a snapshot and close while excluding later provider requests. */
   closeWithSnapshot(
     path: string,
     overwrite: boolean,
-    options?: Pick<ExecutionOptions, "progress">,
+    options?: BinarySessionCloseOptions,
   ): Promise<Result<SavedAnalysisSnapshot, AnalysisError>>;
   status(options?: { readonly signal?: AbortSignal }): Promise<JsonValue>;
   activeTarget(): BinaryTarget | undefined;
@@ -99,7 +92,6 @@ export interface BinarySessionPort
   ): AnalysisProfileCommitment | undefined;
   allowsSnapshotReplay(operation: AnalysisOperation): boolean;
   /** Invalidate cached Evidence before an external command may mutate the target. */
-  invalidateSnapshotForExternalMutation(): void;
   recordWorkflowSnapshot(
     input: WorkflowSnapshotRecordInput,
   ): Result<null, EvidenceIntegrityError>;
