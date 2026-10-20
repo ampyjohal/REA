@@ -506,9 +506,9 @@ Pass the same parent to `inspect_analysis_view` with
 `view: {"kind":"environment-state"}` to extract the initial state the
 capture's reads observed, and a render plan per read tool that reproduces those
 reads from it. Where the environment manifest names an application's tools, the
-state holds its data: entities by type and identity, plus documents for written
-paths whose reads are not entities. Use the `template_rules` of the manifest the
-state accompanies so tool names match; the view groups records the same way.
+state holds its data: entities by type and identity, plus documents for reads
+that are not entities. Use the `template_rules` of the manifest the state
+accompanies so tool names match; the view groups records the same way.
 
 ```json
 {
@@ -544,13 +544,27 @@ refused for them, as the manifest is not.
 
 Each `GET` tool whose template ends in a parameter is an item tool, and its
 type's `collection_template` is the template without that parameter; any other
-`GET` tool is a list tool of its own template. An item tool proves its type's
+`GET` tool is a list tool of its own template. Empty segments are ignored, so a
+trailing slash names the same collection. An item tool proves its type's
 `id_field` when every initial response carries the requested path value in the
-same field, at the root or in one wrapper member (`id_basis: "path-parameter"`).
-Otherwise the field is the first of `id`, `uid`, `uuid`, `_id`, `ID`, `UID`,
-`Id`, `guid`, `key`, `slug` and `name` that every listed item carries as a
-distinct string or number (`id_basis: "field-name"`). A list is the response
-array, or the one array of objects in an envelope that is not itself an entity.
+same field of one entity object (`id_basis: "path-parameter"`). The object is
+the response itself or one wrapper member; failing both, it is the only element
+of a one-element array at the root (pointer `/0`) or in one member
+(`/<member>/0`), as in `{"posts":[{...}]}` or `{"data":[{...}]}`, provided one
+of the identity names below repeats the value, since a filtered list may also
+answer with one element that repeats its parent's value. Otherwise the field is
+the first of `id`, `uid`, `uuid`, `_id`, `ID`, `UID`, `Id`, `guid`, `key`,
+`slug` and `name` that every listed item carries as a distinct string or
+number; when none does, it is the first key of the first listed item, in its
+order, whose name ends in `Id` or `_id` (such as `orgId` or `user_id`), that
+every item carries as a distinct string or number, and that at least one
+initial response shows distinct across two or more items
+(`id_basis: "field-name"`). A single listed item is distinct from nothing, and
+its suffix-named fields are often foreign keys, so a list that only ever held
+one item is left to a document. Empty initial lists constrain no field. A list
+is the response array, or the one array of objects in an envelope that is not
+itself an entity, preferring an array whose items an identity name identifies,
+then an array of two or more items a suffix-named field identifies.
 
 `entities` merge every initial observation of one identity within one
 collection path: an item view's latest values win over a list view's, a view
@@ -565,12 +579,12 @@ Every entity cites its `record_ordinals`.
 
 `views` lists one plan per read tool in tool order:
 
-| Shape      | Plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `item`     | The entity object at `pointer` (the root or one member), the ordered `fields` the view shows and the `required_fields` every recording had, and `envelope_ordinal`: the recording whose response, with the entity replaced, every item response shares                                                                                                                                                                                                                                                                      |
-| `list`     | The array at `pointer`, its `fields`, `membership` (`all`: every entity of the collection in state order, when each recording listed exactly that, had no query, no item-total member (`total`, `count`, `totalCount`, `item_count`, `totalcount`, `itemcount`, but not `total_pages` or `per_page`; a number or a string of digits) differing from the number listed, and no `has_more`, `next` or next-page token member set; `recorded`: the entities each recording listed) and `counters` that equal the number listed |
-| `document` | The path's latest initial value, held in `documents`                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `recorded` | A `reason` the tool replays its recordings instead                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Shape      | Plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `item`     | The entity object at `pointer` (the root, one member, or `/0` or `/<member>/0`), the ordered `fields` the view shows and the `required_fields` every recording had, and `envelope_ordinal`: the recording whose response, with the entity replaced, every item response shares                                                                                                                                                                                                                                                                                                                                                                                       |
+| `list`     | The array at `pointer`, its `fields`, `membership` (`all`: every entity of the collection in state order, when each recording listed exactly that, had no query or only paging parameters (`limit`, `offset`, `page`, `per_page`, `perpage`, `page_size`, `pagesize`, `size`, `start`, `_start`, `_end`), no item-total member (`total`, `count`, `totalCount`, `item_count`, `totalcount`, `itemcount`, but not `total_pages` or `per_page`; a number or a string of digits) differing from the number listed, and no `has_more`, `next` or next-page token member set; `recorded`: the entities each recording listed) and `counters` that equal the number listed |
+| `document` | The latest initial value of a list tool whose responses hold no identified list, when its initial reads share one request line; held in `documents` with that `path`, whether or not the capture writes it, unless its value changed across any recorded write between those reads (`fields-differ`)                                                                                                                                                                                                                                                                                                                                                                 |
+| `recorded` | A `reason` the tool replays its recordings instead                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 An item or list plan is kept only when it reproduces the latest initial
 recording of each request line from the state, comparing JSON values without
@@ -578,24 +592,69 @@ regard to member order; a volatile field compares its recorded value. Each
 plan lists the `checked_record_ordinals`. Otherwise the tool is a recorded view
 with reason `envelope-varies`, `fields-differ` or `list-differs`; the other
 reasons are `query-body` (a query `POST`), `no-init-recording`,
-`body-unusable`, `not-entity`, `no-identity` and `query-varies` (a document
-read under several queries). Documents are held only for list-shaped paths
-that a `POST`, `PUT` or `PATCH` tool writes: a non-entity read of an item path
-such as `/api/files/{id}`, or of a path that is only deleted, stays recorded
-with `no-identity` or `not-entity`. A body is usable when its content type is
+`body-unusable`, `no-identity` (an item read without a proved identity),
+`path-varies` (another read under more than one path, as a template with a
+parameter before its end) and `query-varies` (another read of one path under
+more than one query). A document holds the value of its one `path`, so for such
+a template it says nothing about the template's other paths. A body is usable
+when its content type is
 JSON-like, it is UTF-8 text of at most 256 KiB, every number survives native
 conversion exactly, and no member is named `__proto__`.
+
+`writes` lists one plan per tool whose request may change state, in tool
+order. Its `effect` is `create` for a `POST` to a type's
+`collection_template`, `update` for a `PUT`, `PATCH` or `POST` to that template
+plus one trailing parameter, `delete` for a `DELETE` to it, `document` for a
+`PUT`, `PATCH` or `POST` to a document's path, and otherwise `none` with reason
+`no-state-target`. A plan is built from the tool's first successful call: its
+request body must be a usable JSON object (as response bodies are usable), and
+the written entity must show in that call's response or in a later read before
+the next write. Each field of a created entity gets the first rule that
+explains it: generated `identity` (a sequence, UUID or token, by the recorded
+value's shape), `echo` of a body member, `copy` of a body string of 8 or more
+characters, a `path` value, a `slug` of a body member, a `clock` value within 10
+minutes of the request in its recorded format, a `sequence` one past the
+largest value of its collection or type, a `unique` UUID, or a `template` around
+a generated value; other fields keep the observed value. An update's members
+echo when stored as sent; a member stored differently is accepted only with its
+recorded value (`body.fixed`), and a field it changed without sending must be a
+clock, an increment or a slug, or the plan is `unexplained-change`. Every
+member the first call sent is required, except by `PATCH` and `POST` updates.
+
+The view then replays the timeline on a copy of the initial state. Modelled
+writes apply their effect; any other write leaves the entity below whose item
+path it wrote unknown until a read shows it again (a whole collection when the
+path names no held entity), and taints what it wrote at or above. A read the
+served environment would answer from the state is compared with its recording
+as the read plans are, a 400, 404 or 410 (or a `null` body) agreeing with an
+entity the copy does not hold. A match confirms the writes that changed its
+entity or collection since it was last read; a mismatch contradicts them, or,
+when an unmodelled write came after them, is checked only on the members they
+sent; a mismatch no write explains marks the related writes since as
+`side-effect`. A plan is `served` when a read confirmed it and none
+contradicted it; otherwise its `reason` is the first of its build reason
+(`no-call`, `body-unusable`, `no-observation`, `unexplained-change`),
+`contradicted` (with `contradicted_by`), `side-effect`, `unconfirmed` and `incomplete-entities` (an update or delete that answers with the entity, when no initial entity holds every field its recorded answer shows, so it could answer only for entities the environment created).
+`checked_record_ordinals` lists the confirming reads, `insert` places created
+entities (sorted by a field the collection's recorded order shows, else last),
+and `write_clock` is the end of the last timed record, to the next second.
 
 Values in the state are recorded data, so the view refuses the same parents as
 the manifest, including those inspected with `sensitive_values`, and a
 `capture_browser_scenario` parent must have selected response bodies. Types and
 identity are inferences, so the Evidence is always inferred. `unknowns` states
 that the state establishes no authorization model, no way the application
-computes responses or derived values, and no effects of writes. The state
+computes responses or derived values, and write effects only as modelled from
+recorded calls. The state
 accumulator charges the manifest's admission and grouping, every record line,
 each body as temporary bytes before it is decoded and parsed, and every value
-it keeps, within the same 96 MiB budget. The view performs no network activity
-and serves nothing.
+it keeps, within the same 96 MiB budget. Documents hold whole recorded response
+values of up to 256 KiB each, so a capture with many read-only paths yields a
+correspondingly larger state result. The view performs no network activity and
+serves nothing; `rea environment-serve` derives it from the capture at startup,
+serves read tools and the served write plans from it and loads replacement
+states through the AgentEnv data plane, as
+[serve from the state](agent-environments.md#serve-from-the-state) describes.
 
 ## Resource and lifecycle boundaries
 
