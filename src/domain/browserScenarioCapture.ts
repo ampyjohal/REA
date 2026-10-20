@@ -1,45 +1,198 @@
 import { z } from "zod";
-import { browserNetworkContentSelectionValuesSchema } from "./browserNetworkEvidence.js";
-import { browserScenarioCaptureLimitsValuesSchema } from "./browserScenarioCaptureLimits.js";
-
+import { browserNetworkContentUnavailable } from "./browserNetworkEvidence.js";
 import {
-  browserScenarioCompletenessSchema,
-  browserScenarioEventFamilySchema,
-  browserScenarioEventOmissionsSchema,
-  browserScenarioEventSchema,
-  browserScenarioStepSchema,
+  capturedFieldsSchema,
+  type CapturedFields,
+} from "./browserScenarioCaptureFields.js";
+import { refineScenarioEvents } from "./browserScenarioCaptureEvents.js";
+import {
+  BROWSER_SCENARIO_POPUP_GAP_FAMILIES,
+  BROWSER_SCENARIO_START_STEP,
+  classifyBrowserScenarioCompleteness,
+  deriveStepCompleteness,
+  enabledScenarioEventFamilies,
+  sameCompletenessSections,
+  type BrowserScenarioCompletenessSection,
 } from "./browserScenarioCaptureValues.js";
 
+/** Step 0 is always the producer's completed implicit start navigation. */
+const refineStartStep = (
+  { steps }: CapturedFields,
+  context: z.RefinementCtx,
+): void => {
+  const start = steps[0];
+  if (
+    start !== undefined &&
+    (start.step_id !== BROWSER_SCENARIO_START_STEP.step_id ||
+      start.action !== BROWSER_SCENARIO_START_STEP.action ||
+      start.status !== "completed")
+  )
+    context.addIssue({
+      code: "custom",
+      path: ["steps", 0],
+      message: `Step 0 must be the completed implicit start navigation (step_id ${BROWSER_SCENARIO_START_STEP.step_id}, action ${BROWSER_SCENARIO_START_STEP.action})`,
+    });
+  // Later windows rise from here, so every receipt belongs to a window or follows one.
+  if (
+    start !== undefined &&
+    start.event_sequence_start !==
+      BROWSER_SCENARIO_START_STEP.event_sequence_start
+  )
+    context.addIssue({
+      code: "custom",
+      path: ["steps", 0, "event_sequence_start"],
+      message: `Step 0's receipt window starts at event sequence ${String(BROWSER_SCENARIO_START_STEP.event_sequence_start)}`,
+    });
+};
+
+const BROWSER_IDENTITIES = {
+  launch: {
+    process_ownership: "provider-owned",
+    cleanup: "terminated-owned-process",
+  },
+  connect: { process_ownership: "external", cleanup: "disconnected-external" },
+} as const;
+
+/** Launch owns and terminates its browser; connect attaches to and disconnects from one. */
+const refineBrowserIdentity = (
+  { browser }: CapturedFields,
+  context: z.RefinementCtx,
+): void => {
+  const expected = BROWSER_IDENTITIES[browser.mode];
+  if (
+    browser.process_ownership !== expected.process_ownership ||
+    browser.cleanup !== expected.cleanup
+  )
+    context.addIssue({
+      code: "custom",
+      path: ["browser"],
+      message: `A ${browser.mode} capture records process_ownership ${expected.process_ownership} and cleanup ${expected.cleanup}`,
+    });
+};
+
+/** What in the capture itself shows that event coverage is incomplete. */
+const eventGapCause = ({
+  browser,
+  scenario,
+  events,
+}: CapturedFields): string | undefined => {
+  if (browser.mode === "connect") return "Connect mode";
+  if (events.dropped > 0) return "Dropping events";
+  const selected = enabledScenarioEventFamilies(
+    scenario.event_families,
+    scenario.network_content,
+  );
+  const popupGap = BROWSER_SCENARIO_POPUP_GAP_FAMILIES.some((family) =>
+    selected.includes(family),
+  );
+  for (const event of events.items) {
+    if (event.kind === "request-unfinished")
+      return `Unfinished request ${event.transaction_id}`;
+    if (
+      event.kind === "network-content" &&
+      browserNetworkContentUnavailable(event.headers, event.body)
+    )
+      return `Unavailable network content for ${event.transaction_id}`;
+    if (event.kind === "popup-opened" && popupGap)
+      return "A popup opened while frame, worker, WebSocket or download events were selected";
+  }
+  return undefined;
+};
+
+/**
+ * Capture completeness aggregates the step ledgers that the steps' own facts
+ * determine; only event coverage adds to it, and events are missing whenever
+ * the capture shows an event gap.
+ */
+const refineCaptureCompleteness = (
+  capture: CapturedFields,
+  context: z.RefinementCtx,
+): void => {
+  const missing: readonly BrowserScenarioCompletenessSection[] =
+    capture.completeness.missing_sections;
+  const eventsMissing = missing.includes("events");
+  const ledgers = capture.steps.map(deriveStepCompleteness);
+  const expected = classifyBrowserScenarioCompleteness(
+    [
+      ...ledgers.flatMap(({ missing_sections: sections }) => sections),
+      ...(eventsMissing ? (["events"] as const) : []),
+    ],
+    ledgers.flatMap(({ truncated_sections: sections }) => sections),
+  );
+  if (
+    !sameCompletenessSections(missing, expected.missing_sections) ||
+    !sameCompletenessSections(
+      capture.completeness.truncated_sections,
+      expected.truncated_sections,
+    )
+  )
+    context.addIssue({
+      code: "custom",
+      path: ["completeness"],
+      message:
+        "Capture completeness must aggregate the step completeness ledgers, each section once; only events may add a missing section",
+    });
+  const gap = eventsMissing ? undefined : eventGapCause(capture);
+  if (gap !== undefined)
+    context.addIssue({
+      code: "custom",
+      path: ["completeness", "missing_sections"],
+      message: `${gap} leaves event coverage incomplete, so events must be missing`,
+    });
+};
+
+const sameUrl = (
+  left: CapturedFields["steps"][number]["before_url"],
+  right: CapturedFields["steps"][number]["after_url"],
+): boolean => JSON.stringify(left) === JSON.stringify(right);
+
+/**
+ * A cancelled step captured nothing, and every step after the first action
+ * that did not complete is a cancellation that never ran: no elapsed time,
+ * navigation or received events. Step 0's outcome is the start-step rule's.
+ */
+const refineStepOutcomes = (
+  { steps }: CapturedFields,
+  context: z.RefinementCtx,
+): void => {
+  let unfinished = false;
+  for (const [index, step] of steps.entries()) {
+    if (
+      step.status === "cancelled" &&
+      Object.values(step.artifacts).some(
+        ({ state }) => state === "captured" || state === "truncated",
+      )
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["steps", index, "artifacts"],
+        message: "A cancelled step has no captured artifact",
+      });
+    if (
+      unfinished &&
+      (step.status !== "cancelled" ||
+        step.elapsed_ms !== 0 ||
+        step.event_sequence_end !== step.event_sequence_start - 1 ||
+        !sameUrl(step.before_url, step.after_url))
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["steps", index],
+        message:
+          "Steps after an action that did not complete are cancellations that never ran: no elapsed time, navigation or received events",
+      });
+    if (index > 0 && step.status !== "completed") unfinished = true;
+  }
+};
+
 /** Step-indexed browser scenario observation. */
-export const browserScenarioCaptureSchema = z
-  .strictObject({
-    browser: z.strictObject({
-      mode: z.enum(["launch", "connect"]),
-      process_ownership: z.enum(["provider-owned", "external"]),
-      cleanup: z.enum(["terminated-owned-process", "disconnected-external"]),
-      product: z.string().min(1),
-      version: z.string().min(1),
-    }),
-    scenario: z.strictObject({
-      start_origin: z.string().min(1),
-      action_count: z.number().int().min(1),
-      secret_references: z.array(z.string().min(1)),
-      network_content: browserNetworkContentSelectionValuesSchema,
-      event_families: z.array(browserScenarioEventFamilySchema),
-      limits: browserScenarioCaptureLimitsValuesSchema,
-    }),
-    duration_ms: z.number().int().min(0),
-    steps: z.array(browserScenarioStepSchema).min(1),
-    events: z.strictObject({
-      retained: z.number().int().min(0),
-      dropped: z.number().int().min(0),
-      items: z.array(browserScenarioEventSchema),
-      omissions: browserScenarioEventOmissionsSchema,
-    }),
-    completeness: browserScenarioCompletenessSchema,
-    limitations: z.array(z.string().min(1)),
-  })
-  .superRefine((capture, context) => {
+export const browserScenarioCaptureSchema = capturedFieldsSchema.superRefine(
+  (capture, context) => {
+    refineBrowserIdentity(capture, context);
+    refineScenarioEvents(capture, context);
+    refineStartStep(capture, context);
+    refineStepOutcomes(capture, context);
+    refineCaptureCompleteness(capture, context);
     const bySequence = new Map(
       capture.events.items.map((event) => [event.sequence, event]),
     );
@@ -108,7 +261,8 @@ export const browserScenarioCaptureSchema = z
         path: ["events", "items"],
         message: "Event references an unknown step index",
       });
-  });
+  },
+);
 export type BrowserScenarioCapture = z.infer<
   typeof browserScenarioCaptureSchema
 >;

@@ -109,10 +109,18 @@ const capturedBody = (
   };
 };
 
+interface NetworkContentSelection {
+  readonly request_body: boolean;
+  readonly response_body: boolean;
+  readonly header_values: boolean;
+}
+
+/** The recorder retains content events only for the body facets the scenario selected. */
 const exchangeEvents = (
   exchange: ScenarioExchange,
   index: number,
   first: number,
+  selected: NetworkContentSelection,
 ) => {
   const transaction = `request-${String(index + 1)}`;
   const url = sanitizeBrowserUrl(`${SCENARIO_ORIGIN}${exchange.url}`);
@@ -138,7 +146,11 @@ const exchangeEvents = (
     transaction_id: transaction,
     source_event_sequence: source,
     phase,
-    headers: { state: "not_requested" as const },
+    // The fixture's transactions record no header names, so selected header
+    // values are captured as an empty list.
+    headers: selected.header_values
+      ? { state: "captured" as const, items: [] }
+      : { state: "not_requested" as const },
     body,
   });
   const events: unknown[] = [
@@ -151,7 +163,7 @@ const exchangeEvents = (
     },
   ];
   let next = first + 1;
-  if (exchange.requestBody !== undefined) {
+  if (selected.request_body && exchange.requestBody !== undefined) {
     events.push(
       content(
         next,
@@ -185,7 +197,7 @@ const exchangeEvents = (
     failure: null,
   });
   next += 1;
-  if (exchange.body !== undefined) {
+  if (selected.response_body && exchange.body !== undefined) {
     events.push(
       content(
         next,
@@ -203,15 +215,16 @@ const exchangeEvents = (
   return { events, next };
 };
 
-const step = (index: number) => ({
+/** Step 0 is the implicit start navigation; step 1 receives every event. */
+const step = (index: number, lastSequence: number) => ({
   step_index: index,
-  step_id: index === 0 ? "initial" : "browse",
-  action: index === 0 ? "initial" : "goto",
+  step_id: index === 0 ? "scenario_start" : "browse",
+  action: index === 0 ? "goto_start" : "wait_for_timeout",
   elapsed_ms: 0,
   before_url: sanitizeBrowserUrl(`${SCENARIO_ORIGIN}/`),
   after_url: sanitizeBrowserUrl(`${SCENARIO_ORIGIN}/`),
   event_sequence_start: 1,
-  event_sequence_end: 0,
+  event_sequence_end: index === 0 ? 0 : lastSequence,
   artifacts: {
     screenshot: { state: "not_requested" },
     dom: { state: "not_requested" },
@@ -233,7 +246,7 @@ const step = (index: number) => ({
 /** A complete, schema-valid scenario capture of the given transactions. */
 export const scenarioCaptureFixture = (
   exchanges: readonly ScenarioExchange[] = SCENARIO_EXCHANGES,
-  networkContent = {
+  networkContent: NetworkContentSelection = {
     request_body: true,
     response_body: true,
     header_values: false,
@@ -242,7 +255,7 @@ export const scenarioCaptureFixture = (
   const items: unknown[] = [];
   let sequence = 1;
   for (const [index, exchange] of exchanges.entries()) {
-    const built = exchangeEvents(exchange, index, sequence);
+    const built = exchangeEvents(exchange, index, sequence, networkContent);
     items.push(...built.events);
     sequence = built.next;
   }
@@ -263,7 +276,7 @@ export const scenarioCaptureFixture = (
       limits: DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
     },
     duration_ms: 1,
-    steps: [step(0), step(1)],
+    steps: [step(0, sequence - 1), step(1, sequence - 1)],
     events: {
       retained: items.length,
       dropped: 0,
@@ -295,6 +308,13 @@ export const scenarioCaptureEvidence = (
       actions: [
         { step_id: "browse", action: "wait_for_timeout", duration_ms: 1 },
       ],
+      // The fixture's steps request no artifacts; it records only network events.
+      capture: {
+        after_each_step: [],
+        at_end: [],
+        events: capture.scenario.event_families,
+        network: capture.scenario.network_content,
+      },
     }),
     capture,
     { id: "fixture", name: "fixture", version: "1" },

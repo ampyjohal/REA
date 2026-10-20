@@ -249,11 +249,7 @@ describe("captured script publication boundary", () => {
   );
 
   it("retains missing sources in a manifest without inventing an analysis directory", async () => {
-    const capture = scriptScenarioFixture();
-    capture.events.items = capture.events.items.filter(
-      ({ kind }) => kind !== "network-content",
-    );
-    capture.events.retained = capture.events.items.length;
+    const capture = scriptScenarioFixture(undefined, { responseBody: false });
     const { input, resources } = await setup(capture);
     const result = await exportWebScripts(input, resources);
     if (!result.ok) throw result.error;

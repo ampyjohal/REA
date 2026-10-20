@@ -14,6 +14,7 @@ import {
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { EvidenceIntegrityError } from "../../domain/evidenceErrors.js";
 import {
+  UNAVAILABLE_SUBJECT_LIMITATION,
   createEvidence,
   parseEvidence,
   type Evidence,
@@ -343,7 +344,13 @@ const createAnalysisViewEvidence = (
         ? "inferred"
         : "derived",
     authority: parent.authority,
-    limitations: result.limitations,
+    // Evidence without a subject states its missing identity once, first.
+    limitations:
+      target === undefined
+        ? result.limitations.filter(
+            (limitation) => limitation !== UNAVAILABLE_SUBJECT_LIMITATION,
+          )
+        : result.limitations,
     ...(result.kind === "native" && parent.relationship_coverage !== null
       ? { relationshipCoverage: parent.relationship_coverage }
       : {}),

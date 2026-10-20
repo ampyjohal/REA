@@ -650,9 +650,9 @@ const completeScenarioCapture = () => {
   });
   return {
     browser: {
-      mode: "connect",
-      process_ownership: "external",
-      cleanup: "disconnected-external",
+      mode: "launch",
+      process_ownership: "provider-owned",
+      cleanup: "terminated-owned-process",
       product: "Chromium",
       version: "149",
     },
@@ -670,7 +670,7 @@ const completeScenarioCapture = () => {
     },
     duration_ms: 1,
     steps: [
-      step(0, "scenario_start", "scenario_start"),
+      step(0, "scenario_start", "goto_start"),
       step(1, "open-settings", "click"),
     ],
     events: {

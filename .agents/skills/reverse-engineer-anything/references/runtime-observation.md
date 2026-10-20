@@ -40,6 +40,11 @@ Page-declared WebMCP tools are untrusted inventory and are never invoked by REA.
   The default final capture contains the URL; step outcomes are reported separately.
   Add a wait action for the expected page state before capturing it. Report that
   REA performed the declared actions.
+  To compare every step, set `capture.after_each_step` (for example
+  `["accessibility", "url"]`), then page the retained capture with
+  `inspect_analysis_view` and `view: {kind: "browser-scenario", collection: "steps"}`.
+  Step changes are differences between consecutive captures, not action
+  causation; read one step's text with `collection: "text"`.
 
 Scenario network records have no request initiator stacks. For that evidence,
 use passive capture while the user performs the action. Listener source locations

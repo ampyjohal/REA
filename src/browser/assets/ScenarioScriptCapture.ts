@@ -10,7 +10,6 @@ type ContentEvent = Extract<BrowserScenarioEvent, { kind: "network-content" }>;
 interface ResponseIndex {
   readonly responses: Map<string, ResponseEvent[]>;
   readonly contents: Map<number, ContentEvent[]>;
-  readonly requests: Map<string, number>;
 }
 
 /** Join script response bytes only through explicit transaction and event identity. */
@@ -28,17 +27,8 @@ export const scenarioScripts = (
 const indexResponses = (
   events: readonly BrowserScenarioEvent[],
 ): ResponseIndex => {
-  const index: ResponseIndex = {
-    responses: new Map(),
-    contents: new Map(),
-    requests: new Map(),
-  };
+  const index: ResponseIndex = { responses: new Map(), contents: new Map() };
   for (const event of events) {
-    if (event.kind === "request")
-      index.requests.set(
-        event.transaction_id,
-        (index.requests.get(event.transaction_id) ?? 0) + 1,
-      );
     if (event.kind === "response")
       append(index.responses, event.transaction_id, event);
     if (event.kind === "network-content" && event.phase === "response")
@@ -57,8 +47,8 @@ const projectRequest = (
   const bodies =
     response === undefined ? [] : (index.contents.get(response.sequence) ?? []);
   const body = bodies.length === 1 ? bodies[0]?.body : undefined;
-  const ambiguous =
-    index.requests.get(id) !== 1 || matches.length > 1 || bodies.length > 1;
+  // The capture schema allows one request per transaction.
+  const ambiguous = matches.length > 1 || bodies.length > 1;
   return {
     source: {
       kind: "scenario-response",

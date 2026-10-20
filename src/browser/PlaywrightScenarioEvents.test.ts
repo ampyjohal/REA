@@ -2,6 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import type { BrowserContext, Page, Request, Response } from "playwright-core";
 
 import { browserScenarioSchema } from "../domain/browserScenario.js";
+import { browserScenarioCaptureSchema } from "../domain/browserScenarioCapture.js";
+import {
+  browserScenarioFixtureCapture,
+  scenarioFixtureCompleteness,
+  scenarioFixtureStepsReceivingAll,
+} from "../domain/browserScenarioCapture.fixture.js";
 import { BrowserScenarioSecrets } from "./BrowserScenarioSecrets.js";
 import { PlaywrightScenarioEvents } from "./PlaywrightScenarioEvents.js";
 
@@ -77,7 +83,7 @@ describe("declared secrets in scenario events", () => {
 });
 
 const captureNetworkBudgetFixture = async (
-  maxTotalEventAllocationBytes?: number,
+  limits?: Readonly<Record<string, number>>,
 ) => {
   const pageListeners = new Map<string, (value: unknown) => void>();
   const contextListeners = new Map<string, (value: unknown) => void>();
@@ -100,13 +106,7 @@ const captureNetworkBudgetFixture = async (
     capture: {
       events: ["network"],
       network: { response_body: true },
-      ...(maxTotalEventAllocationBytes === undefined
-        ? {}
-        : {
-            limits: {
-              max_total_event_allocation_bytes: maxTotalEventAllocationBytes,
-            },
-          }),
+      ...(limits === undefined ? {} : { limits }),
     },
   });
   const secrets = BrowserScenarioSecrets.resolve(scenario, {});
@@ -155,7 +155,9 @@ const captureNetworkBudgetFixture = async (
   }
   await capture.finish();
   return {
+    scenario,
     result: capture.result(),
+    limitations: capture.limitations(),
     redactedByteValues: redactBytes.mock.calls.length,
   };
 };
@@ -163,7 +165,9 @@ const captureNetworkBudgetFixture = async (
 describe("PlaywrightScenarioEvents", () => {
   it("identifies omitted network transaction content and honors a raised budget", async () => {
     const baseline = await captureNetworkBudgetFixture();
-    const raised = await captureNetworkBudgetFixture(32 * 1024 * 1024);
+    const raised = await captureNetworkBudgetFixture({
+      max_total_event_allocation_bytes: 32 * 1024 * 1024,
+    });
     expect(baseline.result.dropped).toBeGreaterThan(0);
     expect(
       baseline.result.omissions.by_kind.find(
@@ -283,6 +287,93 @@ describe("PlaywrightScenarioEvents", () => {
       stack: "s".repeat(300_000),
     });
   });
+});
+
+it("accounts network metadata over its budget as omissions its capture accepts", async () => {
+  const { scenario, result, limitations } = await captureNetworkBudgetFixture({
+    max_network_metadata_allocation_bytes: 1,
+  });
+  expect(result.omissions.by_kind).toContainEqual(
+    expect.objectContaining({
+      kind: "request",
+      reasons: ["max-network-metadata-allocation-bytes"],
+    }),
+  );
+  expect(result.omissions.network_transactions.length).toBeGreaterThan(0);
+  const fixture = browserScenarioFixtureCapture();
+  expect(
+    browserScenarioCaptureSchema.safeParse({
+      ...fixture,
+      scenario: {
+        ...fixture.scenario,
+        event_families: ["network"],
+        network_content: scenario.capture.network,
+        limits: scenario.capture.limits,
+      },
+      steps: scenarioFixtureStepsReceivingAll(
+        fixture.steps,
+        result.retained + result.dropped,
+      ),
+      events: result,
+      completeness: scenarioFixtureCompleteness(
+        fixture.steps,
+        limitations.length > 0,
+      ),
+    }).error?.issues,
+  ).toBeUndefined();
+});
+
+it("accounts an unadmitted popup page as an omission its capture accepts", () => {
+  const listeners = new Map<string, (value: unknown) => void>();
+  const page = {
+    on: (name: string, listener: (value: unknown) => void) => {
+      listeners.set(name, listener);
+    },
+  } as unknown as Page;
+  const popup = {
+    url: () => "https://app.example.test/popup",
+    on: () => undefined,
+  } as unknown as Page;
+  const scenario = browserScenarioSchema.parse({
+    browser: { mode: "launch", executable_path: "/opt/chromium" },
+    start_url: { url: "https://app.example.test/" },
+    actions: [{ step_id: "wait", action: "wait_for_timeout", duration_ms: 1 }],
+    capture: { events: ["page-errors"], limits: { max_events: 1 } },
+  });
+  const secrets = BrowserScenarioSecrets.resolve(scenario, {});
+  if (secrets === undefined) throw new Error("Expected resolved secrets");
+  const events = new PlaywrightScenarioEvents({
+    page,
+    enabled: new Set(["page-errors"]),
+    limits: scenario.capture.limits,
+    secrets,
+  });
+  listeners.get("pageerror")?.(new Error("retained application failure"));
+  listeners.get("popup")?.(popup);
+
+  const recorded = events.result();
+  // Popups are unselected, but the rejected page's page errors went unobserved.
+  expect(recorded.omissions.by_kind).toEqual([
+    { kind: "popup-opened", count: 1, reasons: ["max-events"] },
+  ]);
+  const fixture = browserScenarioFixtureCapture();
+  expect(
+    browserScenarioCaptureSchema.safeParse({
+      ...fixture,
+      scenario: {
+        ...fixture.scenario,
+        event_families: ["page-errors"],
+        limits: scenario.capture.limits,
+      },
+      steps: scenarioFixtureStepsReceivingAll(
+        fixture.steps,
+        recorded.retained + recorded.dropped,
+      ),
+      events: recorded,
+      // Dropped events make event coverage incomplete.
+      completeness: scenarioFixtureCompleteness(fixture.steps, true),
+    }).success,
+  ).toBe(true);
 });
 
 it("retains ordinary event volumes and reports event-count exhaustion", () => {

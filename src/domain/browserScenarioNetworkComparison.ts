@@ -4,11 +4,17 @@ import type { BrowserScenarioNormalizationRule } from "./browserScenarioDiffValu
 import { digestCanonicalValue } from "./canonicalDigest.js";
 import { normalizeScenarioValue } from "./browserScenarioNormalization.js";
 
-/** Numeric links are temporary local indices, never durable transaction identity. */
+/**
+ * Numeric links are temporary local indices, never durable transaction
+ * identity. step_index is the retained request's step; without a retained
+ * request it falls back to the step of the transaction's first retained
+ * event, and request_retained says which.
+ */
 export const scenarioNetworkTransactionSchema = z.strictObject({
   events: z.array(z.unknown()),
   predecessor: z.number().int().min(-2),
   step_index: z.number().int().min(0),
+  request_retained: z.boolean(),
 });
 export type ScenarioNetworkTransaction = z.infer<
   typeof scenarioNetworkTransactionSchema
@@ -34,6 +40,7 @@ export const scenarioNetworkTransactions = (
       predecessorState: "root" | "unknown" | undefined;
       predecessorConflict: boolean;
       stepIndex: number;
+      requestRetained: boolean;
     }
   >();
   for (const { sequence: _sequence, step_index: step, ...event } of capture
@@ -88,6 +95,7 @@ export const scenarioNetworkTransactions = (
             (event.redirected_from_transaction_state === "root" &&
               request.redirected_from_transaction_id !== null)),
         stepIndex: requestStep ?? step,
+        requestRetained: request !== undefined,
       });
     else {
       previous.events.push(evidence);
@@ -127,6 +135,7 @@ export const scenarioNetworkTransactions = (
           : -2
         : (indices.get(node.predecessor) ?? -2),
     step_index: node.stepIndex,
+    request_retained: node.requestRetained,
   }));
 };
 

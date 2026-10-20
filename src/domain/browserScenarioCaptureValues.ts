@@ -134,6 +134,35 @@ export type BrowserScenarioEventFamily = z.infer<
   typeof browserScenarioEventFamilySchema
 >;
 
+/**
+ * Selected families whose events from a popup page before its discovery are
+ * unavailable, so a retained popup-opened record leaves their coverage incomplete.
+ */
+export const BROWSER_SCENARIO_POPUP_GAP_FAMILIES = [
+  "frames",
+  "workers",
+  "websockets",
+  "downloads",
+] as const satisfies readonly BrowserScenarioEventFamily[];
+
+/**
+ * Families a capture observes. Selecting any network content also enables
+ * network metadata, while captures record only the declared families.
+ */
+export const enabledScenarioEventFamilies = (
+  declared: Iterable<BrowserScenarioEventFamily>,
+  content: {
+    readonly request_body: boolean;
+    readonly response_body: boolean;
+    readonly header_values: boolean;
+  },
+): BrowserScenarioEventFamily[] => {
+  const families = new Set(declared);
+  if (content.request_body || content.response_body || content.header_values)
+    families.add("network");
+  return [...families].sort();
+};
+
 const eventBase = {
   sequence: z.number().int().min(1),
   step_index: z.number().int().min(0),
@@ -302,6 +331,54 @@ export const browserScenarioEventKindSchema = z.enum([
   "popup-closed",
   "download-cancelled",
 ]);
+export type BrowserScenarioEventKind = z.infer<
+  typeof browserScenarioEventKindSchema
+>;
+
+const EVENT_KIND_FAMILIES = {
+  console: "console",
+  "page-error": "page-errors",
+  request: "network",
+  response: "network",
+  "request-failed": "network",
+  "request-finished": "network",
+  "request-unfinished": "network",
+  "network-content": "network",
+  "websocket-opened": "websockets",
+  "websocket-closed": "websockets",
+  "websocket-frame-sent": "websockets",
+  "websocket-frame-received": "websockets",
+  "frame-attached": "frames",
+  "frame-detached": "frames",
+  "frame-navigated": "frames",
+  "worker-created": "workers",
+  "worker-closed": "workers",
+  "popup-opened": "popups",
+  "popup-closed": "popups",
+  "download-cancelled": "downloads",
+} as const satisfies Record<
+  BrowserScenarioEventKind,
+  BrowserScenarioEventFamily
+>;
+
+/** The family whose selection records an event kind. */
+export const browserScenarioEventKindFamily = (
+  kind: BrowserScenarioEventKind,
+): BrowserScenarioEventFamily => EVENT_KIND_FAMILIES[kind];
+
+/**
+ * Whether omission accounting can name a kind under the selected families.
+ * Popup discovery serves every selected family, so a popup page that fails
+ * admission is accounted as an omitted popup-opened record even when popups
+ * are not selected; the page's selected events were not observed.
+ */
+export const browserScenarioOmissionKindSelected = (
+  kind: BrowserScenarioEventKind,
+  selected: ReadonlySet<BrowserScenarioEventFamily>,
+): boolean =>
+  selected.has(browserScenarioEventKindFamily(kind)) ||
+  (kind === "popup-opened" && selected.size > 0);
+
 export const browserScenarioEventBudgetReasonSchema = z.enum([
   "max-events",
   "max-event-allocation-bytes",
@@ -407,6 +484,16 @@ export const classifyBrowserScenarioCompleteness = (
   };
 };
 
+/**
+ * The implicit start navigation every capture records as completed step 0,
+ * whose receipt window opens at the first event sequence.
+ */
+export const BROWSER_SCENARIO_START_STEP = {
+  step_id: "scenario_start",
+  action: "goto_start",
+  event_sequence_start: 1,
+} as const;
+
 const browserScenarioStepShape = {
   step_index: z.number().int().min(0),
   step_id: z.string().min(1),
@@ -419,18 +506,81 @@ const browserScenarioStepShape = {
   artifacts: browserStepArtifactsSchema,
   completeness: browserScenarioCompletenessSchema,
 };
-export const browserScenarioStepSchema = z.union([
-  z.strictObject({
-    ...browserScenarioStepShape,
-    status: z.literal("completed"),
-    error: z.null(),
-  }),
-  z.strictObject({
-    ...browserScenarioStepShape,
-    status: z.enum(["failed", "cancelled"]),
-    error: z.string(),
-  }),
-]);
+/** Whether a recorded ledger lists exactly the expected sections, each once. */
+export const sameCompletenessSections = (
+  recorded: readonly BrowserScenarioCompletenessSection[],
+  expected: readonly BrowserScenarioCompletenessSection[],
+): boolean => {
+  const sorted = [...new Set(recorded)].sort();
+  const wanted = [...new Set(expected)].sort();
+  return (
+    sorted.length === recorded.length &&
+    sorted.length === wanted.length &&
+    sorted.every((section, index) => section === wanted[index])
+  );
+};
+
+/**
+ * A step's completeness as its own facts determine it: each missing or
+ * truncated artifact names its section, and an action that did not complete
+ * names the action section.
+ */
+export const deriveStepCompleteness = (step: {
+  readonly status: "completed" | "failed" | "cancelled";
+  readonly artifacts: BrowserStepArtifacts;
+}): BrowserScenarioCompleteness => {
+  const sections = browserStepArtifactsSchema.keyof().options;
+  return classifyBrowserScenarioCompleteness(
+    [
+      ...sections.filter(
+        (section) => step.artifacts[section].state === "missing",
+      ),
+      ...(step.status === "completed" ? [] : (["action"] as const)),
+    ],
+    sections.filter((section) => step.artifacts[section].state === "truncated"),
+  );
+};
+
+/** Step completeness restates the step's own facts and records nothing else. */
+const refineStepCompleteness = (
+  step: Parameters<typeof deriveStepCompleteness>[0] & {
+    readonly completeness: BrowserScenarioCompleteness;
+  },
+  context: z.RefinementCtx,
+): void => {
+  const expected = deriveStepCompleteness(step);
+  if (
+    !sameCompletenessSections(
+      step.completeness.missing_sections,
+      expected.missing_sections,
+    ) ||
+    !sameCompletenessSections(
+      step.completeness.truncated_sections,
+      expected.truncated_sections,
+    )
+  )
+    context.addIssue({
+      code: "custom",
+      path: ["completeness"],
+      message:
+        "Step completeness must list exactly the missing and truncated artifacts, plus the action section when the action did not complete",
+    });
+};
+
+export const browserScenarioStepSchema = z
+  .union([
+    z.strictObject({
+      ...browserScenarioStepShape,
+      status: z.literal("completed"),
+      error: z.null(),
+    }),
+    z.strictObject({
+      ...browserScenarioStepShape,
+      status: z.enum(["failed", "cancelled"]),
+      error: z.string(),
+    }),
+  ])
+  .superRefine(refineStepCompleteness);
 export type BrowserScenarioStep = z.infer<typeof browserScenarioStepSchema>;
 type StepOutcome<Step> = Step extends BrowserScenarioStep
   ? Pick<Step, "status" | "error">

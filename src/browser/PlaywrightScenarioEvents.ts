@@ -12,7 +12,9 @@ import type {
 
 import type { SanitizedBrowserUrl } from "../domain/browserObservation.js";
 import {
+  BROWSER_SCENARIO_POPUP_GAP_FAMILIES,
   browserScenarioEventSchema,
+  enabledScenarioEventFamilies,
   type BrowserScenarioEvent,
 } from "../domain/browserScenarioCaptureValues.js";
 import type { BrowserScenarioSecrets } from "./BrowserScenarioSecrets.js";
@@ -107,9 +109,9 @@ export class PlaywrightScenarioEvents {
       response_body: false,
       header_values: false,
     };
-    this.enabled = new Set(options.enabled);
-    if (network.request_body || network.response_body || network.header_values)
-      this.enabled = new Set([...this.enabled, "network"]);
+    this.enabled = new Set(
+      enabledScenarioEventFamilies(options.enabled, network),
+    );
     this.secrets = options.secrets;
     this.limits = options.limits ?? DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS;
     this.ownsContext = options.ownsContext === true;
@@ -587,18 +589,15 @@ export class PlaywrightScenarioEvents {
 
   private popup(page: Page): void {
     if (this.pages.has(page)) return;
+    // A rejected page is accounted as an omitted popup-opened record even
+    // when popups are unselected: its selected-family events go unobserved.
     if (
       !this.admitOwner("popup-opened") ||
       !this.admitText("popup-opened", page.url())
     )
       return;
     this.pages.add(page);
-    for (const family of [
-      "frames",
-      "workers",
-      "websockets",
-      "downloads",
-    ] as const)
+    for (const family of BROWSER_SCENARIO_POPUP_GAP_FAMILIES)
       if (this.enabled.has(family)) this.incompleteFamilies.add(family);
     const opened = {
       url: page.url() === "" ? null : this.safeUrl(page.url()),

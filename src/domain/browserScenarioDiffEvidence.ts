@@ -1,5 +1,4 @@
 import type {
-  BrowserScenarioCompleteness,
   BrowserScenarioCompletenessSection,
   BrowserScenarioStep,
   BrowserStepArtifacts,
@@ -15,6 +14,7 @@ import type {
   BrowserScenarioEvidenceState,
   BrowserScenarioNormalizationRule,
 } from "./browserScenarioDiffValues.js";
+import { digestNormalizedScenarioValue } from "./browserScenarioNormalization.js";
 
 /** Capture-state input consumed by browser scenario artifact comparison. */
 export type CaptureState<Value> =
@@ -28,67 +28,132 @@ export type CaptureState<Value> =
       readonly reason: string;
     };
 
-const includesCompletenessSection = (
-  completeness: BrowserScenarioCompleteness,
-  collection: "missing_sections" | "truncated_sections",
-  section: BrowserScenarioCompletenessSection,
-): boolean => {
-  const sections: readonly BrowserScenarioCompletenessSection[] =
-    completeness[collection];
-  return sections.includes(section);
-};
-
-/** Project one captured artifact through its step-level completeness ledger. */
+/**
+ * Project one recorded artifact through its step outcome. The capture schema
+ * keeps step completeness equal to the artifact states and outcome, so only an
+ * action that did not complete makes a captured value missing.
+ */
 export const artifactEvidenceState = <Value>(
   artifact: BrowserScenarioArtifactKind,
   state: CaptureState<Value>,
   step: BrowserScenarioStep,
 ): BrowserScenarioEvidenceState => {
   if (state.state !== "captured") return state.state;
-  const section = artifact === "action_state" ? "action" : artifact;
-  if (
-    includesCompletenessSection(
-      step.completeness,
-      "truncated_sections",
-      section,
-    )
-  )
-    return "truncated";
-  return includesCompletenessSection(
-    step.completeness,
-    "missing_sections",
-    section,
-  )
+  return artifact === "action_state" && step.status !== "completed"
     ? "missing"
     : "captured";
 };
 
-const EVENT_SECTIONS = [
-  "events",
-  "frames",
-  "workers",
-  "popups",
-  "websockets",
-] as const;
+/** One recorded artifact as the comparison owner sees it at one step. */
+export interface ScenarioArtifactObservation {
+  readonly state: BrowserScenarioEvidenceState;
+  /** Normalized comparison digest; present only for ledger-captured artifacts. */
+  readonly sha256: string | null;
+}
 
-/** Project event evidence through capture- and step-level completeness. */
-export const eventEvidenceState = (
-  capture: BrowserScenarioCapture,
+/** One recorded value to observe at one step, with its comparison projection. */
+export interface ScenarioArtifactInput<Value> {
+  readonly artifact: BrowserScenarioArtifactKind;
+  readonly state: CaptureState<Value>;
+  readonly step: BrowserScenarioStep;
+  readonly rules: readonly BrowserScenarioNormalizationRule[];
+  readonly project?: (value: Value) => unknown;
+}
+
+/** Project one recorded value through its step ledger and comparison digest. */
+export const observeScenarioArtifact = <Value>({
+  artifact,
+  state,
+  step,
+  rules,
+  project = (value) => value,
+}: ScenarioArtifactInput<Value>): ScenarioArtifactObservation => {
+  const evidenceState = artifactEvidenceState(artifact, state, step);
+  return {
+    state: evidenceState,
+    sha256:
+      evidenceState === "captured" && state.state === "captured"
+        ? digestNormalizedScenarioValue(project(state.value), artifact, rules)
+        : null,
+  };
+};
+
+/** Step artifacts that record page state after the step, in comparison order. */
+export const BROWSER_SCENARIO_STATE_ARTIFACTS = [
+  "screenshot",
+  "dom",
+  "accessibility",
+  "url",
+  "history",
+  "storage",
+] as const satisfies readonly (keyof BrowserStepArtifacts)[];
+export type BrowserScenarioStateArtifact = keyof BrowserStepArtifacts;
+
+const textProjection = ({ text }: { readonly text: string }): string => text;
+
+/** Observe every page-state artifact of one step with the shared projections. */
+export const observeScenarioStepState = (
   step: BrowserScenarioStep,
+  rules: readonly BrowserScenarioNormalizationRule[],
+): Readonly<
+  Record<BrowserScenarioStateArtifact, ScenarioArtifactObservation>
+> => {
+  const { artifacts } = step;
+  return {
+    screenshot: observeScenarioArtifact({
+      artifact: "screenshot",
+      state: artifacts.screenshot,
+      step,
+      rules,
+      project: screenshotProjection,
+    }),
+    dom: observeScenarioArtifact({
+      artifact: "dom",
+      state: artifacts.dom,
+      step,
+      rules,
+      project: textProjection,
+    }),
+    accessibility: observeScenarioArtifact({
+      artifact: "accessibility",
+      state: artifacts.accessibility,
+      step,
+      rules,
+      project: textProjection,
+    }),
+    url: observeScenarioArtifact({
+      artifact: "url",
+      state: artifacts.url,
+      step,
+      rules,
+    }),
+    history: observeScenarioArtifact({
+      artifact: "history",
+      state: artifacts.history,
+      step,
+      rules,
+    }),
+    storage: observeScenarioArtifact({
+      artifact: "storage",
+      state: artifacts.storage,
+      step,
+      rules,
+    }),
+  };
+};
+
+/**
+ * Event coverage for the whole capture. The capture schema keeps missing
+ * "events" the only event section in any completeness ledger and requires it
+ * whenever events were dropped, so one rule covers every step.
+ */
+export const captureEventEvidenceState = (
+  capture: BrowserScenarioCapture,
 ): BrowserScenarioEvidenceState => {
-  const listed = (collection: "missing_sections" | "truncated_sections") =>
-    EVENT_SECTIONS.some(
-      (section) =>
-        includesCompletenessSection(
-          capture.completeness,
-          collection,
-          section,
-        ) ||
-        includesCompletenessSection(step.completeness, collection, section),
-    );
-  if (capture.events.dropped > 0 || listed("truncated_sections"))
-    return "truncated";
-  return listed("missing_sections") ? "missing" : "captured";
+  const missing: readonly BrowserScenarioCompletenessSection[] =
+    capture.completeness.missing_sections;
+  if (capture.events.dropped > 0) return "truncated";
+  return missing.includes("events") ? "missing" : "captured";
 };
 
 /** Select stable action fields for normalized comparison. */
@@ -183,7 +248,7 @@ export const captured = <Value>(value: Value): CaptureState<Value> => ({
 });
 
 /** Retain stable screenshot identity without embedding image bytes. */
-export const screenshotProjection = (
+const screenshotProjection = (
   screenshot: Extract<
     BrowserStepArtifacts["screenshot"],
     { state: "captured" }

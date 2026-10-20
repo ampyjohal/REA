@@ -123,3 +123,12 @@ export type BrowserNetworkContentSelection = z.infer<
 >;
 export type BrowserNetworkBody = z.infer<typeof browserNetworkBodySchema>;
 export type BrowserNetworkHeaders = z.infer<typeof browserNetworkHeadersSchema>;
+
+/** Whether retained network content records that selected content was not obtained. */
+export const browserNetworkContentUnavailable = (
+  headers: BrowserNetworkHeaders,
+  body: BrowserNetworkBody,
+): boolean =>
+  headers.state === "unavailable" ||
+  body.state === "unavailable" ||
+  body.state === "not_exposed";

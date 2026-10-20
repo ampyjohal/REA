@@ -3,15 +3,17 @@ import type { BrowserScenarioStep } from "./browserScenarioCaptureValues.js";
 import { z } from "zod";
 import { digestCanonicalValue } from "./canonicalDigest.js";
 import {
+  BROWSER_SCENARIO_STATE_ARTIFACTS,
   actionState,
-  artifactEvidenceState,
+  captureEventEvidenceState,
   captured,
-  eventEvidenceState,
   eventFamilyCoverageReason,
+  observeScenarioArtifact,
+  observeScenarioStepState,
   prepareScenarioEvents,
   networkContentCoverageReason,
-  screenshotProjection,
   type CaptureState,
+  type ScenarioArtifactObservation,
 } from "./browserScenarioDiffEvidence.js";
 import {
   browserScenarioDiffSchema,
@@ -25,7 +27,6 @@ import {
 } from "./browserScenarioDiffValues.js";
 import {
   commitBrowserScenarioNormalization,
-  digestNormalizedScenarioValue,
   normalizeScenarioValue,
 } from "./browserScenarioNormalization.js";
 
@@ -34,7 +35,8 @@ const scenarioEventsValueSchema = z.strictObject({
   network_transactions: z.array(z.string()),
 });
 
-type ComparableArtifact = {
+/** One artifact comparison; only changed and unknown results carry a reportable diff. */
+export type ComparableArtifact = {
   readonly artifact: BrowserScenarioArtifactKind;
 } & (
   | {
@@ -295,64 +297,37 @@ interface CompareStepArtifactsInput {
 const compareStepArtifacts = (
   input: CompareStepArtifactsInput,
 ): ComparableArtifact[] => {
-  const common = {
-    beforeStep: input.beforeStep,
-    afterStep: input.afterStep,
-    rules: input.rules,
-  };
+  const before = observeScenarioStepState(input.beforeStep, input.rules);
+  const after = observeScenarioStepState(input.afterStep, input.rules);
   return [
-    compareCapturedValues({
-      ...common,
-      artifact: "action_state",
-      before: captured(actionState(input.beforeStep)),
-      after: captured(actionState(input.afterStep)),
-    }),
-    compareCapturedValues({
-      ...common,
-      artifact: "screenshot",
-      before: input.beforeStep.artifacts.screenshot,
-      after: input.afterStep.artifacts.screenshot,
-      project: screenshotProjection,
-    }),
-    compareCapturedValues({
-      ...common,
-      artifact: "dom",
-      before: input.beforeStep.artifacts.dom,
-      after: input.afterStep.artifacts.dom,
-      project: ({ text }) => text,
-    }),
-    compareCapturedValues({
-      ...common,
-      artifact: "accessibility",
-      before: input.beforeStep.artifacts.accessibility,
-      after: input.afterStep.artifacts.accessibility,
-      project: ({ text }) => text,
-    }),
-    compareCapturedValues({
-      ...common,
-      artifact: "url",
-      before: input.beforeStep.artifacts.url,
-      after: input.afterStep.artifacts.url,
-    }),
-    compareCapturedValues({
-      ...common,
-      artifact: "history",
-      before: input.beforeStep.artifacts.history,
-      after: input.afterStep.artifacts.history,
-    }),
-    compareCapturedValues({
-      ...common,
-      artifact: "storage",
-      before: input.beforeStep.artifacts.storage,
-      after: input.afterStep.artifacts.storage,
-    }),
+    classifyScenarioArtifactObservations(
+      "action_state",
+      observeScenarioArtifact({
+        artifact: "action_state",
+        state: captured(actionState(input.beforeStep)),
+        step: input.beforeStep,
+        rules: input.rules,
+      }),
+      observeScenarioArtifact({
+        artifact: "action_state",
+        state: captured(actionState(input.afterStep)),
+        step: input.afterStep,
+        rules: input.rules,
+      }),
+    ),
+    ...BROWSER_SCENARIO_STATE_ARTIFACTS.map((artifact) =>
+      classifyScenarioArtifactObservations(
+        artifact,
+        before[artifact],
+        after[artifact],
+      ),
+    ),
     compareScenarioEvents({
-      ...common,
-      artifact: "events",
+      rules: input.rules,
       before: captured(input.beforeEvents.forStep(input.beforeStep.step_index)),
       after: captured(input.afterEvents.forStep(input.afterStep.step_index)),
-      beforeState: eventEvidenceState(input.beforeCapture, input.beforeStep),
-      afterState: eventEvidenceState(input.afterCapture, input.afterStep),
+      beforeState: captureEventEvidenceState(input.beforeCapture),
+      afterState: captureEventEvidenceState(input.afterCapture),
       incomparableReason: eventCoverageReason(
         input.beforeCapture,
         input.afterCapture,
@@ -368,19 +343,12 @@ const compareStepArtifacts = (
 };
 
 const compareScenarioEvents = (
-  input: CompareCapturedValuesInput<{
-    readonly events: readonly unknown[];
-    readonly network_transactions: readonly string[];
-  }>,
+  input: CompareScenarioEventsInput,
 ): ComparableArtifact => {
-  const beforeState =
-    input.beforeState ??
-    artifactEvidenceState(input.artifact, input.before, input.beforeStep);
-  const afterState =
-    input.afterState ??
-    artifactEvidenceState(input.artifact, input.after, input.afterStep);
+  const artifact = "events";
+  const { beforeState, afterState } = input;
   if (beforeState === "not_requested" && afterState === "not_requested")
-    return { artifact: input.artifact, status: "not_compared", diff: null };
+    return { artifact, status: "not_compared", diff: null };
   const beforeValue =
     input.before.state === "captured" ? input.before.value : undefined;
   const afterValue =
@@ -416,10 +384,10 @@ const compareScenarioEvents = (
     isCaptured && ordinaryBeforeDigest !== ordinaryAfterDigest;
   if (changedOrdinaryEvents && input.familyIncomparableReason === undefined)
     return {
-      artifact: input.artifact,
+      artifact: artifact,
       status: "changed",
       diff: {
-        artifact: input.artifact,
+        artifact: artifact,
         status: "changed",
         before_state: beforeState,
         after_state: afterState,
@@ -434,10 +402,10 @@ const compareScenarioEvents = (
     input.familyIncomparableReason !== undefined
   )
     return {
-      artifact: input.artifact,
+      artifact: artifact,
       status: "unknown",
       diff: {
-        artifact: input.artifact,
+        artifact: artifact,
         status: "unknown",
         before_state: beforeState,
         after_state: afterState,
@@ -454,12 +422,12 @@ const compareScenarioEvents = (
   if (beforeSha256 === null || afterSha256 === null)
     throw new TypeError("Captured event digest refinement failed");
   if (beforeSha256 === afterSha256)
-    return { artifact: input.artifact, status: "unchanged", diff: null };
+    return { artifact: artifact, status: "unchanged", diff: null };
   return {
-    artifact: input.artifact,
+    artifact: artifact,
     status: "changed",
     diff: {
-      artifact: input.artifact,
+      artifact: artifact,
       status: "changed",
       before_state: beforeState,
       after_state: afterState,
@@ -500,86 +468,50 @@ const eventCoverageReason = (
   return reasons.length === 0 ? undefined : reasons.join(" ");
 };
 
-interface CompareCapturedValuesInput<Value> {
-  readonly artifact: BrowserScenarioArtifactKind;
-  readonly before: CaptureState<Value>;
-  readonly after: CaptureState<Value>;
-  readonly beforeStep: BrowserScenarioStep;
-  readonly afterStep: BrowserScenarioStep;
-  readonly rules: readonly BrowserScenarioNormalizationRule[];
-  readonly project?: (value: Value) => unknown;
-  readonly order?: (normalized: unknown) => unknown;
-  readonly beforeState?: BrowserScenarioEvidenceState;
-  readonly afterState?: BrowserScenarioEvidenceState;
-  readonly incomparableReason?: string | undefined;
-  readonly familyIncomparableReason?: string | undefined;
+interface ScenarioEventsValue {
+  readonly events: readonly unknown[];
+  readonly network_transactions: readonly string[];
 }
 
-const compareCapturedValues = <Value>(
-  input: CompareCapturedValuesInput<Value>,
+interface CompareScenarioEventsInput {
+  readonly before: CaptureState<ScenarioEventsValue>;
+  readonly after: CaptureState<ScenarioEventsValue>;
+  readonly rules: readonly BrowserScenarioNormalizationRule[];
+  readonly beforeState: BrowserScenarioEvidenceState;
+  readonly afterState: BrowserScenarioEvidenceState;
+  readonly incomparableReason: string | undefined;
+  readonly familyIncomparableReason: string | undefined;
+}
+
+/**
+ * Classify two observations of one artifact. Both sides not requested is not
+ * compared; any side outside the captured ledger is unknown; otherwise the
+ * normalized comparison digests decide.
+ */
+export const classifyScenarioArtifactObservations = (
+  artifact: BrowserScenarioArtifactKind,
+  before: ScenarioArtifactObservation,
+  after: ScenarioArtifactObservation,
 ): ComparableArtifact => {
-  const {
-    artifact,
-    before,
-    after,
-    beforeStep,
-    afterStep,
-    rules,
-    project = (value) => value,
-    order,
-  } = input;
-  const beforeState =
-    input.beforeState ?? artifactEvidenceState(artifact, before, beforeStep);
-  const afterState =
-    input.afterState ?? artifactEvidenceState(artifact, after, afterStep);
-  if (beforeState === "not_requested" && afterState === "not_requested")
+  if (before.state === "not_requested" && after.state === "not_requested")
     return { artifact, status: "not_compared", diff: null };
-  const beforeSha256 =
-    beforeState === "captured" && before.state === "captured"
-      ? digestNormalizedScenarioValue(
-          project(before.value),
-          artifact,
-          rules,
-          order,
-        )
-      : null;
-  const afterSha256 =
-    afterState === "captured" && after.state === "captured"
-      ? digestNormalizedScenarioValue(
-          project(after.value),
-          artifact,
-          rules,
-          order,
-        )
-      : null;
-  if (
-    beforeState !== "captured" ||
-    afterState !== "captured" ||
-    before.state !== "captured" ||
-    after.state !== "captured" ||
-    input.incomparableReason !== undefined
-  )
+  if (before.state !== "captured" || after.state !== "captured")
     return {
       artifact,
       status: "unknown",
       diff: {
         artifact,
         status: "unknown",
-        before_state: beforeState,
-        after_state: afterState,
-        before_sha256: beforeSha256,
-        after_sha256: afterSha256,
-        reason:
-          joinIncomparableReasons(
-            input.familyIncomparableReason,
-            input.incomparableReason,
-          ) ??
-          `Artifact coverage is not comparable (${beforeState} before, ${afterState} after).`,
+        before_state: before.state,
+        after_state: after.state,
+        before_sha256: before.sha256,
+        after_sha256: after.sha256,
+        reason: `Artifact coverage is not comparable (${before.state} before, ${after.state} after).`,
       },
     };
-  if (beforeSha256 === null || afterSha256 === null)
+  if (before.sha256 === null || after.sha256 === null)
     throw new TypeError("Captured artifact digest refinement failed");
-  if (beforeSha256 === afterSha256)
+  if (before.sha256 === after.sha256)
     return { artifact, status: "unchanged", diff: null };
   return {
     artifact,
@@ -587,10 +519,10 @@ const compareCapturedValues = <Value>(
     diff: {
       artifact,
       status: "changed",
-      before_state: beforeState,
-      after_state: afterState,
-      before_sha256: beforeSha256,
-      after_sha256: afterSha256,
+      before_state: before.state,
+      after_state: after.state,
+      before_sha256: before.sha256,
+      after_sha256: after.sha256,
       reason: null,
     },
   };

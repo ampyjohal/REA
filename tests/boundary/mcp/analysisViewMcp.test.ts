@@ -49,6 +49,12 @@ import { createTestBinarySession } from "../../fixtures/binarySession.js";
 import { BINARY_LAYOUT_TEST_PROVIDER } from "../../fixtures/binaryDiagnostics/layout.js";
 import { wasmArtifactFixture } from "../../fixtures/wasm/artifact.js";
 import { evmInterfaceFixture } from "../../fixtures/evm/interface.js";
+import { createBrowserScenarioEvidence } from "../../../src/application/BrowserScenarioEvidence.js";
+import {
+  SCENARIO_FIXTURE_OPEN_TREE,
+  browserScenarioFixtureCapture,
+  browserScenarioFixtureScenario,
+} from "../../../src/domain/browserScenarioCapture.fixture.js";
 import type { RelationshipCoverage } from "../../../src/domain/relationshipCoverage.js";
 
 const connect = async (
@@ -1354,4 +1360,112 @@ it("projects an environment manifest identically from retained, portable and fil
   expect(JSON.stringify(refused)).toContain("sensitive_values_unretained");
   expect(JSON.stringify(refused)).not.toContain("/api/folders");
   await client.ping();
+});
+
+it("pages steps and retained text of a recorded browser scenario capture", async () => {
+  const { client, session } = await connect();
+  const parent = createBrowserScenarioEvidence(
+    browserScenarioFixtureScenario(),
+    browserScenarioFixtureCapture(),
+    { id: "rea-playwright-browser-scenario", name: "Playwright", version: "1" },
+  );
+  expect(session.recordEvidence(parent).ok).toBe(true);
+  const { ajv, inputSchema, outputSchema } = await advertisedMcpToolSchemas(
+    client,
+    "inspect_analysis_view",
+  );
+  const source = { kind: "retained-evidence", evidence_id: parent.evidence_id };
+  // Text pages require an explicit UTF-16 limit in the advertised contract.
+  expect(
+    ajv.validate(inputSchema, {
+      source,
+      view: {
+        kind: "browser-scenario",
+        collection: "text",
+        step_index: 1,
+        artifact: "accessibility",
+      },
+    }),
+  ).toBe(false);
+  const steps = await client.callTool({
+    name: "inspect_analysis_view",
+    arguments: {
+      source,
+      view: { kind: "browser-scenario", collection: "steps", offset: 3 },
+    },
+  });
+  expect(steps.isError).not.toBe(true);
+  expect(ajv.validate(outputSchema, steps.structuredContent)).toBe(true);
+  const parsed = toolContract("inspect_analysis_view").outputSchema.parse(
+    steps.structuredContent,
+  );
+  expect(parsed).toMatchObject({
+    confidence: "derived",
+    authority: "controlled-replay",
+    evidence_links: [parent.evidence_id],
+    normalized_result: {
+      kind: "browser-scenario",
+      parent_operation: "capture_browser_scenario",
+      page: {
+        collection: "steps",
+        items: [
+          {
+            step_id: "save",
+            status: "failed",
+            network_transactions: { coverage: "captured", retained: 1 },
+          },
+          { step_id: "confirm-saved", status: "cancelled" },
+        ],
+      },
+      coverage: { examined: 2, total: 5, exhausted: true },
+    },
+  });
+
+  const text = await client.callTool({
+    name: "inspect_analysis_view",
+    arguments: {
+      source,
+      view: {
+        kind: "browser-scenario",
+        collection: "text",
+        step_index: 1,
+        artifact: "accessibility",
+        limit: 4096,
+      },
+    },
+  });
+  expect(text.isError).not.toBe(true);
+  expect(ajv.validate(outputSchema, text.structuredContent)).toBe(true);
+  expect(
+    toolContract("inspect_analysis_view").outputSchema.parse(
+      text.structuredContent,
+    ).normalized_result,
+  ).toMatchObject({
+    page: {
+      item: { coverage: "captured", text: SCENARIO_FIXTURE_OPEN_TREE },
+    },
+    coverage: { exhausted: true },
+  });
+
+  const unknownStep = await client.callTool({
+    name: "inspect_analysis_view",
+    arguments: {
+      source,
+      view: {
+        kind: "browser-scenario",
+        collection: "text",
+        step_index: 5,
+        artifact: "dom",
+        limit: 16,
+      },
+    },
+  });
+  expect(parseMcpToolError(unknownStep)).toMatchObject({
+    error: {
+      code: "invalid_request",
+      details: {
+        issues: [{ path: ["view", "step_index"], reason: "out_of_range" }],
+      },
+    },
+  });
 });

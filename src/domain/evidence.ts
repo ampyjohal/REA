@@ -344,6 +344,10 @@ const rememberImmutableEvidence = (evidence: Evidence): Evidence => {
   return evidence;
 };
 
+/** Default limitation recorded when an observation has no artifact subject. */
+export const UNAVAILABLE_SUBJECT_LIMITATION =
+  "Artifact identity is unavailable for this observation.";
+
 /** Build deterministic Evidence from an immutable artifact subject. */
 export const createEvidence = (
   target: EvidenceSubjectTarget | BinaryTarget | undefined,
@@ -431,7 +435,7 @@ const normalizeEvidenceObservation = (
       ...(target === undefined
         ? [
             observation.subjectUnavailableReason ??
-              "Artifact identity is unavailable for this observation.",
+              UNAVAILABLE_SUBJECT_LIMITATION,
           ]
         : []),
       ...(observation.limitations ?? []),

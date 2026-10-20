@@ -7,7 +7,13 @@ import { browserScenarioEventSchema } from "../../src/domain/browserScenarioCapt
 import { createEvidence } from "../../src/domain/evidence.js";
 import { jsonValueSchema } from "../../src/domain/jsonValue.js";
 
-/** Source-owned script capture with independently authored bytes. */
+/**
+ * Source-owned script capture with independently authored bytes. Each script
+ * is a request, its response and, when response bodies are selected, that
+ * response's content; the terminal request-finished event the recorder also
+ * emits is left out because nothing here reads it. Nothing is dropped, so
+ * sequences run 1..retained, all received in the start navigation's window.
+ */
 export const scriptScenarioFixture = (
   scripts = [
     {
@@ -15,7 +21,9 @@ export const scriptScenarioFixture = (
       bytes: Buffer.from("export const marker = 'fixture-source';\n"),
     },
   ],
+  { responseBody = true }: { readonly responseBody?: boolean } = {},
 ) => {
+  const eventsPerScript = responseBody ? 3 : 2;
   const items = scripts.flatMap(({ url, bytes }, index) => {
     const request = {
       transaction_id: `request-${index + 1}`,
@@ -28,8 +36,8 @@ export const scriptScenarioFixture = (
       failure: null,
       step_index: 0,
     };
-    const start = index * 3 + 1;
-    return [
+    const start = index * eventsPerScript + 1;
+    const metadata = [
       browserScenarioEventSchema.parse({
         ...request,
         sequence: start,
@@ -42,6 +50,10 @@ export const scriptScenarioFixture = (
         kind: "response",
         status: 200,
       }),
+    ];
+    if (!responseBody) return metadata;
+    return [
+      ...metadata,
       browserScenarioEventSchema.parse({
         sequence: start + 2,
         step_index: 0,
@@ -78,7 +90,8 @@ export const scriptScenarioFixture = (
     before_url: sanitizeBrowserUrl("https://fixture.test/"),
     after_url: sanitizeBrowserUrl("https://fixture.test/"),
     error: null,
-    event_sequence_start: 1,
+    // The start navigation receives every event; the later wait receives none.
+    event_sequence_start: index === 0 ? 1 : items.length + 1,
     event_sequence_end: items.length,
     artifacts: {
       screenshot: { state: "not_requested" },
@@ -104,7 +117,7 @@ export const scriptScenarioFixture = (
       secret_references: [],
       network_content: {
         request_body: false,
-        response_body: true,
+        response_body: responseBody,
         header_values: false,
       },
       event_families: ["network"],

@@ -14,6 +14,7 @@ import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { PLAYWRIGHT_BROWSER_SCENARIO_PROVIDER_IDENTITY } from "./providerIdentities.js";
+import { capturedScenarioFields } from "../domain/browserScenarioCaptureFields.js";
 
 const OPERATION = "capture_browser_scenario" as const;
 
@@ -80,16 +81,7 @@ export const browserScenarioCaptureData = (input: {
       product: input.session.product,
       version: input.session.version,
     },
-    scenario: {
-      start_origin: new URL(input.scenario.start_url.url).origin,
-      action_count: input.scenario.actions.length,
-      secret_references: input.scenario.secrets
-        .map(({ secret_id: id }) => id)
-        .sort(),
-      network_content: input.scenario.capture.network,
-      event_families: [...new Set(input.scenario.capture.events)].sort(),
-      limits: input.scenario.capture.limits,
-    },
+    scenario: capturedScenarioFields(input.scenario),
     duration_ms: Math.max(0, Math.round(performance.now() - input.startedAt)),
     steps: [...input.steps],
     events,

@@ -291,6 +291,22 @@ const snapshotKindSchema = z.enum([
   "history",
   "storage",
 ]);
+export const browserScenarioSnapshotKindSchema = snapshotKindSchema;
+export type BrowserScenarioSnapshotKind = z.infer<typeof snapshotKindSchema>;
+
+/** Artifacts a scenario requests at one step: every step's, plus at_end on the final one. */
+export const requestedScenarioArtifacts = (
+  selection: {
+    readonly after_each_step: readonly BrowserScenarioSnapshotKind[];
+    readonly at_end: readonly BrowserScenarioSnapshotKind[];
+  },
+  stepIndex: number,
+  actionCount: number,
+): ReadonlySet<BrowserScenarioSnapshotKind> =>
+  new Set([
+    ...selection.after_each_step,
+    ...(stepIndex === actionCount ? selection.at_end : []),
+  ]);
 
 export const browserScenarioCaptureSchema = z
   .strictObject({

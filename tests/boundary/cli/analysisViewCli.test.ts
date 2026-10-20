@@ -28,6 +28,11 @@ import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 import { ghidraFunctionDossier } from "../../../src/domain/ghidraValues.fixture.js";
 import { createEvidenceBundle } from "../../../src/domain/evidenceBundle.js";
 import { inspectEvidenceBundle } from "../../../src/application/investigation/InspectEvidenceBundle.js";
+import { createBrowserScenarioEvidence } from "../../../src/application/BrowserScenarioEvidence.js";
+import {
+  browserScenarioFixtureCapture,
+  browserScenarioFixtureScenario,
+} from "../../../src/domain/browserScenarioCapture.fixture.js";
 
 cliTest(
   "preserves native relationship coverage independently of exhausted CLI pages",
@@ -757,5 +762,52 @@ cliTest(
       },
     });
     expect(JSON.stringify(result.json)).not.toContain("probe folder");
+  },
+);
+
+cliTest(
+  "summarizes portable browser scenario Evidence through the compiled CLI",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory(
+      "rea-browser-scenario-view-cli-",
+    );
+    const path = join(root, "view.json");
+    const parent = createBrowserScenarioEvidence(
+      browserScenarioFixtureScenario(),
+      browserScenarioFixtureCapture(),
+      {
+        id: "rea-playwright-browser-scenario",
+        name: "Playwright",
+        version: "1",
+      },
+    );
+    await writeFile(
+      path,
+      JSON.stringify({
+        source: { kind: "inline", evidence: parent },
+        view: { kind: "summary" },
+      }),
+    );
+    const result = await cli.run({
+      arguments: ["inspect-analysis-view", path, "--json"],
+    });
+    expect(result.exitCode).toBe(0);
+    const evidence = parseEvidence(result.json);
+    expect(evidence).toMatchObject({
+      evidence_links: [parent.evidence_id],
+      authority: "controlled-replay",
+      normalized_result: {
+        kind: "summary",
+        parent_operation: "capture_browser_scenario",
+        summary: {
+          step_statuses: { completed: 3, failed: 1, cancelled: 1 },
+          network_transactions: {
+            coverage: "captured",
+            retained: 2,
+            omitted_by_transaction_limit: 0,
+          },
+        },
+      },
+    });
   },
 );

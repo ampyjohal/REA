@@ -135,11 +135,20 @@ Choose captures by the question being asked:
 
 Capture states are reported per artifact. An artifact you did not request is
 `not_requested`, which means REA did not look, not that the page had nothing
-to show. A step's `completeness` of `complete` covers only the sections that
-were requested. A URL-only capture can be `complete` and still be unable to
-answer a question about rendered content, so add the relevant artifact and run
-the scenario again rather than inferring from its absence. Capture completeness
-also does not assert that the page's background work has finished.
+to show. A step's `completeness` restates its artifact states: it lists exactly
+the missing and truncated artifacts, plus the action when the action did not
+complete. A cancelled step captures nothing, and every step after the first
+action that did not complete is a cancellation that never ran: no elapsed
+time, navigation or received events. Capture completeness lists each step
+section once and adds only missing `events`. Events are always missing in
+connect mode, after dropped events, and when a retained event shows a gap: an
+unfinished request, unavailable network content, or a popup while frame,
+worker, WebSocket or download events are selected. Gaps that leave no retained
+record can also make them missing. A `complete` step covers only the sections that were requested. A URL-only
+capture can be `complete` and still be unable to answer a question about
+rendered content, so add the relevant artifact and run the scenario again
+rather than inferring from its absence. Capture completeness also does not
+assert that the page's background work has finished.
 
 The browser boundary is part of the contract. Launch mode requires a
 caller-selected executable and always uses a provider-owned temporary profile
@@ -210,7 +219,9 @@ frame belongs to its private seed script; page breakpoints and `debugger`
 statements remain under the attached debugger client's control.
 
 The result is Evidence with an initial state followed by one record per
-declared action. Each step reports action status, elapsed time, sanitized URLs,
+declared action. The initial state is always the completed step 0, with
+`step_id` `scenario_start`, action `goto_start` and a receipt window that
+starts at event sequence 1. Each step reports action status, elapsed time, sanitized URLs,
 event bounds, and independently typed capture states for screenshot, DOM,
 accessibility, URL, history, and storage. Console, page-error, network,
 WebSocket, frame, worker, popup, and cancelled-download events are attributed to
@@ -413,11 +424,83 @@ step. Missing, truncated, or mismatched capture coverage remains unknown
 instead of being treated as equality.
 
 `scenario.event_families` records the sorted, de-duplicated `capture.events`
-selection. Captures with different selections report event evidence as unknown
+selection. Retained events belong only to selected families, and any network
+content selection also selects network events. Omission accounting names only
+selected families, except that a popup page refused by an event budget is an
+omitted `popup-opened` record whenever any family is selected, because popup
+discovery serves every selected family. `network_transaction_range` is present
+exactly when events were dropped for `max-network-transactions`, and each
+omitted transaction dropped at least one. Each `network_transactions` record
+names kinds and budget reasons that `by_kind` dropped, and every budget drop of
+a network kind names its transaction there. `by_kind` keeps one count per kind
+across its reasons, so each row must count at least one drop per listed reason
+and per transaction record naming the kind, and drops of refused transactions
+are bounded rather than counted: the omitted range may not exceed what the
+other reasons leave. Every sequence number the recorder spends belongs to a
+retained or dropped event, and drops of refused transactions spend none, so no
+retained event sequence or step window end exceeds the retained and dropped
+events less the drops known to belong to refused transactions. Network content records headers exactly
+when `header_values` is selected and a body exactly when its phase's body is
+selected; a phase with neither selected neither records nor drops content.
+Each transaction records at most one request event. Retained events never
+exceed `max_events`, and admitted transactions never exceed
+`max_network_transactions`. Launch captures record `provider-owned` and
+`terminated-owned-process`; connect captures record `external` and
+`disconnected-external`. Comparisons and views reject inline captures that
+contradict any of these rules, the completeness rules above or their initial
+state as malformed input. Captures with different selections report event evidence as unknown
 with a recovery instruction, even when no selected family emitted an event.
-Captures written before this field existed omit it, so their event evidence is
-also unknown.
 
 Network normalization also commits the removal of capture-local transaction IDs,
 attribution to the requesting step, and unordered transaction comparison. These
 built-in rule identities participate in the normalization digest.
+
+## Step and text views
+
+`inspect_analysis_view` and `inspect-analysis-view` read a completed capture
+without reopening a browser. Use the retained `evidence_id` returned by the MCP
+capture, or pass the complete Evidence JSON printed by the CLI as an inline
+source.
+
+- `{kind: "summary"}` returns the browser identity, step outcomes, per-artifact
+  capture coverage and step changes, declared and enabled event families,
+  events received outside any step window, and the network transaction count.
+  `without_retained_request` counts the retained transactions whose request
+  event was dropped or never observed, such as a request over the event
+  allocation limit or one already in flight when connect mode attached; the
+  total includes them, but no step row does.
+- `{kind: "browser-scenario", collection: "steps", offset, limit}` pages steps.
+  Each row carries the exact recorded action declaration and its family
+  (`start-navigation`, `navigation`, `input`, or `wait`), outcome, recorded
+  URLs, counts of the events received inside the step's sequence window, and
+  the count of network transactions attributed to the step by their retained
+  request event.
+  The network count is `null` with `not_requested` coverage when network
+  events were not observed. For each artifact requested at this step or the
+  previous one, a row reports the capture coverage, the comparison digest, and
+  the `change` from the previous step's capture. Every page also names the
+  enabled event families and the events received outside any step window.
+- `{kind: "browser-scenario", collection: "text", step_index, artifact, offset, limit}`
+  pages one step's retained `accessibility` or `dom` text in UTF-16 code units.
+
+Step changes use the digests of the scenario comparison above, without
+normalization rules. They describe differences between consecutive captures,
+not what an action caused: timers, network responses, and capture side effects
+between two captures produce the same result, and `wait` steps dispatch no
+input. Equal digests mean equal recorded values, not equal application state.
+An artifact that a step did not request keeps its comparison `unknown` or
+`not_compared`; set `capture.after_each_step` to every artifact the comparison
+needs. Event receipt does not establish causation, responses can arrive during
+later steps, and events received between windows or after the final capture
+fall in no step's receipt window, although the parent records them with the
+step then current: the last step that ran whose window had opened. Views
+reject captures whose events name another step, and captures that do not
+restate the scenario recorded in their parameters: the browser mode, the
+`scenario` fields (start origin, action count, secret references, network
+content, event families and limits), and each step's artifacts, which follow
+`after_each_step` on every step and `at_end` on the final one.
+Selecting network content enables network events even when `capture.events`
+omits `network`. Cancelled steps have no post-action capture. The views do not
+inventory available controls; read the accessibility text for the elements a
+step recorded. View Evidence is derived, keeps the capture's authority, and
+links the capture Evidence.

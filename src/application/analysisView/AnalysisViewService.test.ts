@@ -11,7 +11,16 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "../../contracts/javascript/javascriptRuntimeReconciliationExample.js";
-import { createEvidence, parseEvidence } from "../../domain/evidence.js";
+import {
+  UNAVAILABLE_SUBJECT_LIMITATION,
+  createEvidence,
+  parseEvidence,
+} from "../../domain/evidence.js";
+import {
+  browserScenarioFixtureCapture,
+  browserScenarioFixtureScenario,
+} from "../../domain/browserScenarioCapture.fixture.js";
+import { createBrowserScenarioEvidence } from "../BrowserScenarioEvidence.js";
 import { inspectAnalysisViewInputSchema } from "../../domain/analysisView/analysisView.js";
 import { functionDossierSchema } from "../../domain/hopperValues.js";
 import { ghidraFunctionDossier } from "../../domain/ghidraValues.fixture.js";
@@ -920,6 +929,53 @@ it("admits raw_result and parameters before authenticating a portable capture", 
         error: { _tag: "AnalysisResourceConstraintError", resource: "memory" },
       });
     }
+});
+
+it("derives browser scenario step views that inherit the capture's replay authority", () => {
+  const scenario = browserScenarioFixtureScenario();
+  const parent = createBrowserScenarioEvidence(
+    scenario,
+    browserScenarioFixtureCapture(),
+    { id: "rea-playwright-browser-scenario", name: "Playwright", version: "1" },
+  );
+  const ledger = new EvidenceLedger();
+  const recorded = ledger.record(parent);
+  if (!recorded.ok) throw recorded.error;
+  const view = inspectAnalysisView(
+    {
+      source: { kind: "retained-evidence", evidence_id: parent.evidence_id },
+      view: { kind: "browser-scenario", collection: "steps", limit: 2 },
+    },
+    (id) => ledger.forAnalysis(id),
+  );
+  if (!view.ok) throw view.error;
+
+  expect(view.value).toMatchObject({
+    subject: null,
+    operation: "inspect_analysis_view",
+    confidence: "derived",
+    authority: "controlled-replay",
+    evidence_links: [parent.evidence_id],
+    parameters: {
+      parent_evidence_id: parent.evidence_id,
+      view: {
+        kind: "browser-scenario",
+        collection: "steps",
+        offset: 0,
+        limit: 2,
+      },
+    },
+    normalized_result: {
+      parent_operation: "capture_browser_scenario",
+      coverage: { examined: 2, total: 5, next_offset: 2 },
+    },
+  });
+  // The view Evidence states the missing subject once, not once per source.
+  expect(
+    view.value.limitations.filter(
+      (limitation) => limitation === UNAVAILABLE_SUBJECT_LIMITATION,
+    ),
+  ).toHaveLength(1);
 });
 
 const manifestView = { kind: "environment-manifest" } as const;

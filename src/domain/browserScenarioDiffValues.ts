@@ -89,7 +89,8 @@ export type CompareBrowserScenariosInput = z.infer<
   typeof compareBrowserScenariosInputSchema
 >;
 
-const evidenceStateSchema = z.enum([
+/** Capture state of one artifact after projection through its step completeness ledger. */
+export const browserScenarioEvidenceStateSchema = z.enum([
   "captured",
   "not_requested",
   "missing",
@@ -99,8 +100,8 @@ const evidenceStateSchema = z.enum([
 const artifactDiffSchema = z.strictObject({
   artifact: browserScenarioArtifactKindSchema,
   status: z.enum(["changed", "unknown"]),
-  before_state: evidenceStateSchema,
-  after_state: evidenceStateSchema,
+  before_state: browserScenarioEvidenceStateSchema,
+  after_state: browserScenarioEvidenceStateSchema,
   before_sha256: z
     .string()
     .regex(/^[a-f0-9]{64}$/u)

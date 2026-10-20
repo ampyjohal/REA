@@ -1,7 +1,8 @@
-import type {
-  BrowserNetworkBody,
-  BrowserNetworkHeaders,
-  BrowserNetworkContentSelection,
+import {
+  browserNetworkContentUnavailable,
+  type BrowserNetworkBody,
+  type BrowserNetworkHeaders,
+  type BrowserNetworkContentSelection,
 } from "../../domain/browserNetworkEvidence.js";
 import type { BrowserScenarioCaptureLimits } from "../../domain/browserScenarioCaptureLimits.js";
 import type {
@@ -624,11 +625,7 @@ export class PlaywrightScenarioNetwork {
         );
         return;
       }
-      if (
-        retainedHeaders.state === "unavailable" ||
-        retainedBody.state === "unavailable" ||
-        retainedBody.state === "not_exposed"
-      )
+      if (browserNetworkContentUnavailable(retainedHeaders, retainedBody))
         this.gaps.add(
           "Some selected network content was unavailable; per-transaction content states retain the reason.",
         );

@@ -12,6 +12,11 @@ import {
   type BrowserScenarioCapture,
 } from "./browserScenarioCapture.js";
 import { DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS } from "./browserScenarioCaptureLimits.js";
+import {
+  browserScenarioFixtureCapture,
+  scenarioFixtureCompleteness,
+  scenarioFixtureKeepingEvents,
+} from "./browserScenarioCapture.fixture.js";
 
 const noEventOmissions = {
   by_kind: [],
@@ -19,22 +24,21 @@ const noEventOmissions = {
   network_transaction_range: null,
 } as const;
 
-const networkCapture = (sourceSequence: number, receiptStep: number) => {
-  const base = scenarioCapture({});
-  const events = [
+/** A POST and its selected request body, which directly follows the request. */
+const postWithBody = (transactionId: string, path: string, body: string) => {
+  const bytes = Buffer.from(body);
+  return [
     {
-      sequence: sourceSequence,
-      step_index: 0,
       kind: "request",
       method: "POST",
       url: {
-        url: "https://app.example.test/api",
+        url: `https://app.example.test/${path}`,
         origin: "https://app.example.test",
         query_parameter_names: [],
         redacted: false,
       },
       resource_type: "fetch",
-      transaction_id: "request-1",
+      transaction_id: transactionId,
       redirected_from_transaction_id: null,
       redirected_from_transaction_state: "root",
       header_names: [],
@@ -42,25 +46,59 @@ const networkCapture = (sourceSequence: number, receiptStep: number) => {
       failure: null,
     },
     {
-      sequence: sourceSequence + 1,
-      step_index: receiptStep,
       kind: "network-content",
-      transaction_id: "request-1",
+      transaction_id: transactionId,
       phase: "request",
-      source_event_sequence: sourceSequence,
       headers: { state: "not_requested" },
       body: {
         state: "captured",
         representation: "browser-exposed-request-bytes",
         encoding: "base64",
-        content: "eA==",
-        bytes: 1,
-        sha256: createHash("sha256").update("x").digest("hex"),
+        content: bytes.toString("base64"),
+        bytes: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
         media_type: null,
         redacted: false,
       },
     },
   ];
+};
+
+/**
+ * Step 0 sends request-1, whose body arrives in receiptStep. An unrelated
+ * POST, sent and read in step 0 too, may precede request-1 or follow its
+ * body: it moves request-1's sequence anchor without changing what either
+ * step compares.
+ */
+const networkCapture = (
+  receiptStep: 0 | 1,
+  otherRequest?: "before" | "after",
+) => {
+  const base = scenarioCapture({});
+  const other = postWithBody("request-2", "telemetry", "y");
+  const received = [
+    ...(otherRequest === "before" ? other : []),
+    ...postWithBody("request-1", "api", "x"),
+    ...(otherRequest === "after" ? other : []),
+  ].map((event, index) => ({
+    ...event,
+    sequence: index + 1,
+    ...(event.kind === "network-content"
+      ? { source_event_sequence: index }
+      : {}),
+  }));
+  const lateBody = received.find(
+    (event) =>
+      event.kind === "network-content" && event.transaction_id === "request-1",
+  );
+  if (lateBody === undefined) throw new Error("Expected request-1 body");
+  // Step 1 opens just before a late body; otherwise after every receipt.
+  const stepOneStart =
+    receiptStep === 1 ? lateBody.sequence : received.length + 1;
+  const events = received.map((event) => ({
+    ...event,
+    step_index: event.sequence >= stepOneStart ? 1 : 0,
+  }));
   return browserScenarioCaptureSchema.parse({
     ...base,
     scenario: {
@@ -72,9 +110,18 @@ const networkCapture = (sourceSequence: number, receiptStep: number) => {
       },
       event_families: ["network"],
     },
+    steps: base.steps.map((step) =>
+      step.step_index === 0
+        ? { ...step, event_sequence_end: stepOneStart - 1 }
+        : {
+            ...step,
+            event_sequence_start: stepOneStart,
+            event_sequence_end: events.length,
+          },
+    ),
     events: {
       items: events,
-      retained: 2,
+      retained: events.length,
       dropped: 0,
       omissions: noEventOmissions,
     },
@@ -82,8 +129,28 @@ const networkCapture = (sourceSequence: number, receiptStep: number) => {
 };
 
 it("normalizes network content anchors and attributes late content to its source step", () => {
-  const before = networkCapture(3, 0);
-  const after = networkCapture(90, 1);
+  const before = networkCapture(0, "after");
+  const after = networkCapture(1, "before");
+  const requestBody = (capture: BrowserScenarioCapture) => {
+    const body = capture.events.items.find(
+      (event) =>
+        event.kind === "network-content" &&
+        event.transaction_id === "request-1",
+    );
+    if (body?.kind !== "network-content")
+      throw new Error("Expected content fixture");
+    return body;
+  };
+  // Source anchors and receipt steps differ while the compared events match.
+  expect(
+    [before, after].map((capture) => {
+      const body = requestBody(capture);
+      return [body.source_event_sequence, body.step_index];
+    }),
+  ).toEqual([
+    [1, 0],
+    [3, 1],
+  ]);
   expect(
     compareBrowserScenarios(
       compareBrowserScenariosInputSchema.parse({
@@ -92,29 +159,42 @@ it("normalizes network content anchors and attributes late content to its source
       }),
     ).overall_status,
   ).toBe("unchanged");
-  const content = after.events.items[1];
-  if (content?.kind !== "network-content")
-    throw new Error("Expected content fixture");
-  for (const mutation of [
-    { transaction_id: "another-request" },
-    { source_event_sequence: 91 },
-    { phase: "response" },
-  ])
-    expect(
-      browserScenarioCaptureSchema.safeParse({
+  const content = requestBody(after);
+  const withContent = (mutation: Record<string, unknown>) =>
+    browserScenarioCaptureSchema
+      .safeParse({
         ...after,
         events: {
           ...after.events,
-          items: [after.events.items[0], { ...content, ...mutation }],
+          items: after.events.items.map((event) =>
+            event === content ? { ...content, ...mutation } : event,
+          ),
         },
-      }).success,
-    ).toBe(false);
+      })
+      .error?.issues.map(({ path }) => path);
+  expect(withContent({})).toBeUndefined();
+  // Each mutation breaks the anchor to an earlier event of the same transaction phase.
+  const anchor = [
+    "events",
+    "items",
+    after.events.items.indexOf(content),
+    "source_event_sequence",
+  ];
+  for (const mutation of [
+    { transaction_id: "another-request" },
+    { source_event_sequence: content.sequence },
+    { phase: "response" },
+  ])
+    expect(withContent(mutation)).toContainEqual(anchor);
 });
 
 it("reports content-selection mismatch as unknown instead of a website change", () => {
-  const withBody = networkCapture(1, 0);
+  const withBody = networkCapture(0);
   const metadataOnly = browserScenarioCaptureSchema.parse({
-    ...withBody,
+    ...scenarioFixtureKeepingEvents(
+      withBody,
+      (event) => event.kind !== "network-content",
+    ),
     scenario: {
       ...withBody.scenario,
       network_content: {
@@ -122,13 +202,6 @@ it("reports content-selection mismatch as unknown instead of a website change", 
         response_body: false,
         header_values: false,
       },
-    },
-    events: {
-      ...withBody.events,
-      items: withBody.events.items.filter(
-        (event) => event.kind !== "network-content",
-      ),
-      retained: 1,
     },
   });
   const compared = compareBrowserScenarios(
@@ -215,9 +288,10 @@ it("reports event-family selection mismatch as unknown", () => {
     }).success,
   ).toBe(false);
 
+  // With no family selected, no window receives an event.
   const quiet = browserScenarioCaptureSchema.parse({
-    ...withFamilies(consoleOnly, []),
-    events: { retained: 0, dropped: 0, items: [], omissions: noEventOmissions },
+    ...scenarioFixtureKeepingEvents(consoleOnly, () => false),
+    scenario: { ...consoleOnly.scenario, event_families: [] },
   });
   const differentEvents = compare(quiet, widened);
   expect(differentEvents.overall_status).toBe("unknown");
@@ -226,7 +300,7 @@ it("reports event-family selection mismatch as unknown", () => {
     "unknown",
   ]);
 
-  const both = eventDiffs(compare(networkCapture(1, 0), consoleOnly));
+  const both = eventDiffs(compare(networkCapture(0), consoleOnly));
   expect(both).toContainEqual(
     expect.objectContaining({
       reason: expect.stringMatching(
@@ -283,6 +357,7 @@ const concurrentCapture = (
   ).map((event, index) => ({ ...event, sequence: index + 1 }));
   return browserScenarioCaptureSchema.parse({
     ...base,
+    scenario: { ...base.scenario, event_families: ["network"] },
     events: {
       items: events,
       retained: events.length,
@@ -343,6 +418,7 @@ const redirectChainCapture = (swapLeaves = false, reverseReceipt = false) => {
     .map((event, index) => ({ ...event, sequence: index + 1 }));
   return browserScenarioCaptureSchema.parse({
     ...base,
+    scenario: { ...base.scenario, event_families: ["network"] },
     events: {
       items: events,
       retained: events.length,
@@ -351,6 +427,101 @@ const redirectChainCapture = (swapLeaves = false, reverseReceipt = false) => {
     },
   });
 };
+
+it("keeps every incomparable artifact's states, captured-side digest and reason", () => {
+  const before = browserScenarioFixtureCapture();
+  const screenshotBytes = Buffer.from("iVBORw==", "base64");
+  const afterSteps = before.steps.map((step) => {
+    if (step.step_index === 1)
+      return {
+        ...step,
+        artifacts: {
+          ...step.artifacts,
+          accessibility: {
+            state: "truncated",
+            observed: 900,
+            retained: 0,
+            reason: "accessibility text exceeded its budget",
+          },
+        },
+        completeness: {
+          status: "truncated",
+          equality_eligible: false,
+          missing_sections: [],
+          truncated_sections: ["accessibility"],
+        },
+      };
+    // A URL captured before but missing after stays unknown.
+    if (step.step_index === 2)
+      return {
+        ...step,
+        artifacts: {
+          ...step.artifacts,
+          url: { state: "missing", reason: "URL capture failed" },
+          screenshot: {
+            state: "captured",
+            value: {
+              sha256: createHash("sha256")
+                .update(screenshotBytes)
+                .digest("hex"),
+              bytes: screenshotBytes.byteLength,
+              media_type: "image/png",
+              data_base64: "iVBORw==",
+            },
+          },
+        },
+        completeness: {
+          status: "incomplete",
+          equality_eligible: false,
+          missing_sections: ["url"],
+          truncated_sections: [],
+        },
+      };
+    return step;
+  });
+  const after = browserScenarioCaptureSchema.parse({
+    ...structuredClone(before),
+    steps: afterSteps,
+    completeness: scenarioFixtureCompleteness(afterSteps),
+  });
+  const digest = expect.stringMatching(/^[a-f0-9]{64}$/u);
+  const unknown = (
+    artifact: string,
+    beforeState: string,
+    afterState: string,
+    sides: { readonly before?: unknown; readonly after?: unknown } = {},
+  ) => ({
+    artifact,
+    status: "unknown",
+    before_state: beforeState,
+    after_state: afterState,
+    before_sha256: sides.before ?? null,
+    after_sha256: sides.after ?? null,
+    reason: `Artifact coverage is not comparable (${beforeState} before, ${afterState} after).`,
+  });
+  const steps = compareBrowserScenarios({
+    before_scenario: before,
+    after_scenario: after,
+    normalization: { rules: [] },
+  }).steps;
+
+  expect(steps.map(({ artifact_diffs: diffs }) => diffs)).toEqual([
+    [],
+    [unknown("accessibility", "captured", "truncated", { before: digest })],
+    [
+      unknown("screenshot", "not_requested", "captured", { after: digest }),
+      unknown("url", "captured", "missing", { before: digest }),
+    ],
+    // A failed step lists the action section as missing on both sides.
+    [unknown("action_state", "missing", "missing")],
+    [
+      unknown("action_state", "missing", "missing"),
+      unknown("screenshot", "missing", "missing"),
+      unknown("accessibility", "missing", "missing"),
+      unknown("url", "missing", "missing"),
+    ],
+  ]);
+});
 
 describe("browser scenario network event order", () => {
   it("retains multi-hop redirect ancestry while ignoring IDs and concurrent receipt order", () => {
@@ -614,13 +785,46 @@ describe("browser scenario comparison", () => {
     const before = scenarioCapture({
       domText: "<main data-build='build-123'>Settings</main>",
       elapsedMs: 11,
-      eventSequence: 3,
+      startResponse: "before-action",
     });
     const after = scenarioCapture({
       domText: "<main data-build='build-456'>Settings</main>",
       elapsedMs: 900,
-      eventSequence: 88,
+      startResponse: "after-console",
     });
+    // Equal events arrive in another order, so sequence values and receipt windows differ.
+    expect(
+      [before, after].map(({ steps, events }) => [
+        events.items.map(({ kind, sequence }) => [kind, sequence]),
+        steps.map((step) => [
+          step.event_sequence_start,
+          step.event_sequence_end,
+        ]),
+      ]),
+    ).toEqual([
+      [
+        [
+          ["request", 1],
+          ["response", 2],
+          ["console", 3],
+        ],
+        [
+          [1, 2],
+          [3, 3],
+        ],
+      ],
+      [
+        [
+          ["request", 1],
+          ["console", 2],
+          ["response", 3],
+        ],
+        [
+          [1, 1],
+          [2, 3],
+        ],
+      ],
+    ]);
     const rules = [
       {
         rule_id: "new-build",
@@ -879,10 +1083,15 @@ const multiStepScenarioCapture = (
     capture.steps[0],
     ...Array.from({ length: actionCount }, (_, index) => ({
       ...template,
+      // Step 1 keeps the template's console event; later windows stay empty.
+      ...(index === 0
+        ? {}
+        : {
+            event_sequence_start: template.event_sequence_end + 1,
+            event_sequence_end: template.event_sequence_end,
+          }),
       step_index: index + 1,
       step_id: `step-${String(index + 1)}`,
-      event_sequence_start: index + 1,
-      event_sequence_end: index + 1,
       artifacts: {
         ...template.artifacts,
         dom: {
@@ -904,7 +1113,13 @@ interface ScenarioCaptureOptions {
   readonly action?: string;
   readonly domText?: string;
   readonly elapsedMs?: number;
-  readonly eventSequence?: number;
+  /**
+   * Also select network: step 0 sends one GET whose response arrives before
+   * step 1 opens or after step 1's console event. Its request attributes the
+   * transaction to step 0 either way, so only sequence values, receipt steps
+   * and windows move.
+   */
+  readonly startResponse?: "before-action" | "after-console";
 }
 
 const scenarioCapture = (
@@ -930,7 +1145,52 @@ const scenarioCapture = (
     history: { state: "not_requested" },
     storage: { state: "not_requested" },
   });
-  const eventSequence = options.eventSequence ?? 1;
+  const consoleEvent = {
+    step_index: 1,
+    kind: "console",
+    level: "info",
+    text: "settings-ready",
+    url: null,
+  };
+  const startTransaction = (kind: "request" | "response", step: number) => ({
+    step_index: step,
+    kind,
+    transaction_id: "start-config",
+    redirected_from_transaction_id: null,
+    redirected_from_transaction_state: "root",
+    method: "GET",
+    url: {
+      url: "https://app.example.test/config.json",
+      origin: "https://app.example.test",
+      query_parameter_names: [],
+      redacted: false,
+    },
+    resource_type: "fetch",
+    header_names: [],
+    status: kind === "response" ? 200 : null,
+    failure: null,
+  });
+  const received =
+    options.startResponse === undefined
+      ? [consoleEvent]
+      : options.startResponse === "before-action"
+        ? [
+            startTransaction("request", 0),
+            startTransaction("response", 0),
+            consoleEvent,
+          ]
+        : [
+            startTransaction("request", 0),
+            consoleEvent,
+            startTransaction("response", 1),
+          ];
+  const events = received.map((event, index) => ({
+    ...event,
+    sequence: index + 1,
+  }));
+  // Step 1's window opens after every event step 0 received.
+  const stepOneStart =
+    events.filter(({ step_index: step }) => step === 0).length + 1;
   return browserScenarioCaptureSchema.parse({
     browser: {
       mode: "launch",
@@ -948,7 +1208,10 @@ const scenarioCapture = (
         response_body: false,
         header_values: false,
       },
-      event_families: ["console"],
+      event_families:
+        options.startResponse === undefined
+          ? ["console"]
+          : ["console", "network"],
       limits: DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
     },
     duration_ms: options.elapsedMs ?? 10,
@@ -956,14 +1219,14 @@ const scenarioCapture = (
       {
         step_index: 0,
         step_id: "scenario_start",
-        action: "scenario_start",
+        action: "goto_start",
         status: "completed",
         elapsed_ms: 0,
         before_url: url,
         after_url: url,
         error: null,
         event_sequence_start: 1,
-        event_sequence_end: 0,
+        event_sequence_end: stepOneStart - 1,
         artifacts: artifacts("<main>Ready</main>"),
         completeness,
       },
@@ -976,25 +1239,16 @@ const scenarioCapture = (
         before_url: url,
         after_url: url,
         error: null,
-        event_sequence_start: eventSequence,
-        event_sequence_end: eventSequence,
+        event_sequence_start: stepOneStart,
+        event_sequence_end: events.length,
         artifacts: artifacts(options.domText ?? "<main>Settings</main>"),
         completeness,
       },
     ],
     events: {
-      retained: 1,
+      retained: events.length,
       dropped: 0,
-      items: [
-        {
-          sequence: eventSequence,
-          step_index: 1,
-          kind: "console",
-          level: "info",
-          text: "settings-ready",
-          url: null,
-        },
-      ],
+      items: events,
       omissions: noEventOmissions,
     },
     completeness,

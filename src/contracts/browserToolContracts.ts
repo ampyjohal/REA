@@ -24,6 +24,7 @@ import {
   browserCaptureComparisonSchema,
 } from "../domain/browserCaptureComparison.js";
 import { DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS } from "../domain/browserScenarioCaptureLimits.js";
+import { BROWSER_SCENARIO_START_STEP } from "../domain/browserScenarioCaptureValues.js";
 import {
   captureWebScreenshotInputSchema,
   compareWebScreenshotsInputSchema,
@@ -70,9 +71,9 @@ const scenarioArtifacts = {
 };
 const exampleScenarioCapture = () => ({
   browser: {
-    mode: "connect",
-    process_ownership: "external",
-    cleanup: "disconnected-external",
+    mode: "launch",
+    process_ownership: "provider-owned",
+    cleanup: "terminated-owned-process",
     product: "Chromium",
     version: "149",
   },
@@ -92,8 +93,8 @@ const exampleScenarioCapture = () => ({
   steps: [
     {
       step_index: 0,
-      step_id: "scenario_start",
-      action: "scenario_start",
+      step_id: BROWSER_SCENARIO_START_STEP.step_id,
+      action: BROWSER_SCENARIO_START_STEP.action,
       status: "completed",
       elapsed_ms: 0,
       before_url: scenarioUrl,

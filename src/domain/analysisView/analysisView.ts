@@ -181,6 +181,13 @@ import {
   dartAotViewContextSchema,
 } from "./dartAotView.js";
 import {
+  browserScenarioSummarySchema,
+  browserScenarioViewContextSchema,
+  browserScenarioViewPageSchema,
+  browserScenarioViewRequestSchema,
+} from "./browserScenarioViewSchemas.js";
+import { projectBrowserScenarioView } from "./browserScenarioView.js";
+import {
   projectIl2cppMetadataView,
   il2cppMetadataSummarySchema,
   il2cppMetadataViewRequestSchema,
@@ -295,6 +302,7 @@ export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
   qlogViewRequestSchema,
   pcapViewRequestSchema,
   dartAotViewRequestSchema,
+  browserScenarioViewRequestSchema,
   il2cppMetadataViewRequestSchema,
   modelArtifactViewRequestSchema,
 ]);
@@ -401,6 +409,7 @@ const viewResultBase = {
     "inspect_android_package",
     "inspect_pcap_capture",
     "inspect_dart_aot",
+    "capture_browser_scenario",
     "inspect_il2cpp_metadata",
     "inspect_model_artifact",
     ...NATIVE_INVENTORY_OPERATIONS,
@@ -592,6 +601,13 @@ export const nativeInventorySummaryViewResultSchema = z.strictObject({
   summary: nativeInventorySummarySchema,
 });
 
+/** Capture identity, step outcomes, coverage and events for selected browser scenario delivery. */
+export const browserScenarioSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("capture_browser_scenario"),
+  summary: browserScenarioSummarySchema,
+});
+
 /** Compact native matching discovery retains the complete matching report. */
 export const nativeFunctionMatchingSummaryViewResultSchema = z.strictObject({
   ...summaryViewResultBase,
@@ -663,6 +679,7 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     il2cppMetadataSummaryViewResultSchema,
     modelArtifactSummaryViewResultSchema,
     nativeInventorySummaryViewResultSchema,
+    browserScenarioSummaryViewResultSchema,
     nativeFunctionMatchingSummaryViewResultSchema,
   ]),
   z.strictObject({
@@ -810,6 +827,14 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
   }),
   modelArtifactPageViewResultSchema,
   z.strictObject({
+    kind: z.literal("browser-scenario"),
+    view: browserScenarioViewRequestSchema,
+    page: browserScenarioViewPageSchema,
+    ...viewResultBase,
+    ...browserScenarioViewContextSchema.shape,
+    parent_operation: z.literal("capture_browser_scenario"),
+  }),
+  z.strictObject({
     kind: z.literal("il2cpp-metadata"),
     view: il2cppMetadataViewRequestSchema,
     items: il2cppMetadataViewItemsSchema,
@@ -902,9 +927,7 @@ const unsupportedParent = (
   new AnalysisUnsupportedTargetError(
     INSPECT_ANALYSIS_VIEW_OPERATION,
     parentArtifactPath(parent),
-    parent.operation === "capture_browser_scenario"
-      ? `Parent Evidence operation "capture_browser_scenario" supports only the environment-manifest and environment-state views.`
-      : `Parent Evidence operation ${JSON.stringify(parent.operation)} does not support analysis views. Use completed binary layout, JavaScript application, native function/inventory, artifact inventory/inspection, WASM, Mach-O, Interface Builder, EVM, managed artifact or member, Android package, Dart AOT, IL2CPP metadata, or web network capture Evidence.`,
+    `Parent Evidence operation ${JSON.stringify(parent.operation)} does not support analysis views. Use completed binary layout, JavaScript application, native function/inventory, artifact inventory/inspection, WASM, Mach-O, Interface Builder, EVM, managed artifact or member, Android package, Dart AOT, IL2CPP metadata, web network capture, or browser scenario capture Evidence.`,
   );
 
 const parentArtifactPath = (parent: AnalysisViewParent): string => {
@@ -950,6 +973,7 @@ const retainedViewProjectors = new Map<string, typeof projectWasmArtifactView>([
   ["match_native_functions", projectNativeFunctionMatchingView],
   ["inspect_artifact", projectArtifactInventoryView],
   ["inventory_artifact", projectArtifactInventoryView],
+  ["capture_browser_scenario", projectBrowserScenarioView],
 ]);
 
 /** Budgets a caller created before admitting the source; each grouping view uses its own. */
