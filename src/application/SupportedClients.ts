@@ -170,6 +170,9 @@ const kimiDirectory = ({ home, env }: ClientPathContext): string =>
 const qoderDirectory = ({ home, env }: ClientPathContext): string =>
   env.QODER_CONFIG_DIR || join(home, ".qoder");
 
+const openclawDirectory = ({ home, env }: ClientPathContext): string =>
+  env.OPENCLAW_HOME || join(home, ".openclaw");
+
 const factoryDirectory = ({ home }: ClientPathContext): string =>
   join(home, ".factory");
 
@@ -658,6 +661,16 @@ export const SUPPORTED_CLIENT_DEFINITIONS = [
     configPath: (context: ClientPathContext) =>
       join(qoderDirectory(context), "settings.json"),
     markerPath: qoderDirectory,
+    format: "json",
+  },
+  {
+    name: "openclaw",
+    displayName: "OpenClaw",
+    skillPath: (context: ClientPathContext) =>
+      join(openclawDirectory(context), "skills"),
+    configPath: (context: ClientPathContext) =>
+      join(openclawDirectory(context), "openclaw.json"),
+    markerPath: openclawDirectory,
     format: "json",
   },
   {

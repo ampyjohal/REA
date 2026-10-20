@@ -299,6 +299,14 @@ For [Qoder](https://docs.qoder.com/cli/mcp-reference), setup writes
 from `~/.qoder/skills` (following `QODER_CONFIG_DIR` when set), so setup
 installs its skill copy there.
 
+## OpenClaw
+
+For [OpenClaw](https://github.com/openclaw/openclaw), setup writes
+`mcpServers.rea` into `~/.openclaw/openclaw.json` (the `OPENCLAW_HOME` override
+is honored). Entries carry `command`, `args`, and `env`; stdio is the default
+transport. OpenClaw discovers personal skills from `~/.openclaw/skills`, so setup
+installs its skill copy there.
+
 ## Factory Droid
 
 For [Factory Droid](https://docs.factory.com/harness/mcp), setup writes
