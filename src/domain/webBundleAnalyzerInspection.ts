@@ -10,6 +10,7 @@ import { completeSemanticSteps } from "./javascript/javascriptSemanticTraversal.
 import type { JavaScriptOpenReceiverFact } from "./javascript/javascriptSemanticAnalysis.js";
 import { isIntrinsicMapLookup } from "./javascript/javascriptSemanticMapOperations.js";
 import {
+  semanticFinalObjectProperty,
   semanticStaticPropertyKey,
   semanticStaticPropertyName,
   unwrapJavaScriptExpression,
@@ -23,7 +24,6 @@ import {
   location,
   locationFields,
   objectString,
-  objectValue,
   resolveSpecifier,
   isUrlLikeModuleSpecifier,
 } from "./webBundleAnalyzerAst.js";
@@ -366,10 +366,10 @@ const addWebMcpDeclaration = (
   const name = objectString(declaration, "name");
   const description = objectString(declaration, "description");
   const schema =
-    objectValue(declaration, "inputSchema") ??
-    objectValue(declaration, "input_schema");
+    semanticFinalObjectProperty(declaration, "inputSchema") ??
+    semanticFinalObjectProperty(declaration, "input_schema");
   const properties = t.isObjectExpression(schema)
-    ? objectValue(schema, "properties")
+    ? semanticFinalObjectProperty(schema, "properties")
     : undefined;
   const schemaPropertyNames = t.isObjectExpression(properties)
     ? properties.properties.flatMap((property) => {

@@ -6,7 +6,11 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
-import { captureFrames } from "./CdpElectronInspection.js";
+import {
+  captureFrames,
+  inspectCdpElectronPage,
+} from "./CdpElectronInspection.js";
+import type { CdpEvent } from "./CdpConnection.js";
 import type { CdpConnection } from "./CdpConnection.js";
 import {
   ingestElectronScriptEvent,
@@ -14,8 +18,200 @@ import {
 } from "./CdpElectronScriptEvents.js";
 import { captureElectronScripts } from "./CdpElectronScripts.js";
 import { inspectElectronPageInputSchema } from "../domain/javascript/electronObservation.js";
+import type { ProgressReporter } from "../application/ProgressReporter.js";
 
 const temporary: string[] = [];
+
+const inspectRaceConnection = (
+  connection: CdpConnection,
+  mainUrl: string,
+  progress?: ProgressReporter,
+) =>
+  inspectCdpElectronPage({
+    connection,
+    ...(progress === undefined ? {} : { progress }),
+    sessionId: undefined,
+    discovery: {
+      webSocket: { scope: "browser", url: "ws://127.0.0.1:9222" },
+      version: {
+        product: "fixture",
+        protocol_version: "1",
+        revision: "",
+        user_agent: "fixture",
+        js_version: "",
+      },
+      targets: [],
+    },
+    target: {
+      id: "page",
+      type: "page",
+      title: "fixture",
+      url: mainUrl,
+      attached: false,
+    },
+    input: inspectElectronPageInputSchema.parse({
+      cdp_endpoint: "http://127.0.0.1:9222",
+      target_id: "page",
+      observation_ms: 0,
+    }),
+  });
+
+it.each([
+  "initial",
+  "refreshed",
+  "final",
+  "ancestor",
+  "opaque-ancestor",
+  "stable",
+])(
+  "binds frame authorization to the tree read across file checks: %s",
+  async (stage) => {
+    const isAncestor = stage.endsWith("ancestor");
+    const root = await mkdtemp(join(tmpdir(), "rea-frame-generation-race-"));
+    temporary.push(root);
+    const main = join(root, "main.html"),
+      child = join(root, "child.html"),
+      script = join(root, "app.js");
+    await Promise.all([
+      writeFile(main, "main"),
+      writeFile(child, "child"),
+      writeFile(script, "void 0;"),
+    ]);
+    const mainUrl = pathToFileURL(main).href,
+      childUrl = pathToFileURL(child).href;
+    let listener: (event: CdpEvent) => void = () => {};
+    let reads = 0,
+      fired = false;
+    const emitScript = () => {
+      listener({
+        method: "Runtime.executionContextCreated",
+        params: { context: { id: 7, auxData: { frameId: "child" } } },
+      });
+      listener({
+        method: "Debugger.scriptParsed",
+        params: {
+          scriptId: "new-document-script",
+          url: pathToFileURL(script).href,
+          executionContextId: 7,
+          hash: "new-document",
+        },
+      });
+    };
+    const inject = () => {
+      listener({
+        method: "Page.frameNavigated",
+        params: {
+          frame: {
+            id: isAncestor ? "parent" : "child",
+            parentId: "main",
+            url: "https://foreign.test/new-document",
+          },
+        },
+      });
+      if (stage !== "initial") emitScript();
+    };
+    const connection = {
+      onEvent: (value: typeof listener) => {
+        listener = value;
+        return () => {};
+      },
+      send: async (method: string) => {
+        if (method === "Page.getFrameTree") {
+          reads++;
+          const shouldInject =
+            (stage === "initial" && reads === 1) ||
+            (stage === "refreshed" && reads === 2) ||
+            (isAncestor && reads === 2) ||
+            (stage === "final" && reads === 3);
+          return {
+            frameTree: {
+              frame: { id: "main", url: mainUrl },
+              childFrames:
+                (stage === "initial" && reads > 1) ||
+                (stage === "refreshed" && reads !== 2) ||
+                (isAncestor && reads !== 2) ||
+                (stage === "final" && reads === 1)
+                  ? []
+                  : [
+                      {
+                        frame: {
+                          id: isAncestor ? "parent" : "child",
+                          parentId: "main",
+                          get url() {
+                            if (shouldInject && !isAncestor && !fired) {
+                              fired = true;
+                              queueMicrotask(inject);
+                            }
+                            return stage === "opaque-ancestor"
+                              ? "about:blank"
+                              : childUrl;
+                          },
+                        },
+                        ...(isAncestor
+                          ? {
+                              childFrames: [
+                                {
+                                  frame: {
+                                    id: "child",
+                                    parentId: "parent",
+                                    get url() {
+                                      if (shouldInject && !fired) {
+                                        fired = true;
+                                        queueMicrotask(inject);
+                                      }
+                                      return childUrl;
+                                    },
+                                  },
+                                },
+                              ],
+                            }
+                          : {}),
+                      },
+                    ],
+            },
+          };
+        }
+        if (method === "Debugger.enable" && stage === "initial") emitScript();
+        if (method === "Debugger.enable" && stage === "stable") {
+          listener({
+            method: "Runtime.executionContextCreated",
+            params: { context: { id: 7, auxData: { frameId: "child" } } },
+          });
+          listener({
+            method: "Debugger.scriptParsed",
+            params: {
+              scriptId: "stable-script",
+              url: pathToFileURL(script).href,
+              executionContextId: 7,
+              hash: "stable",
+            },
+          });
+        }
+        if (method === "Page.getResourceTree")
+          return {
+            frameTree: { frame: { id: "main", url: mainUrl }, resources: [] },
+          };
+        if (method === "DOMSnapshot.captureSnapshot")
+          return { strings: [], documents: [] };
+        if (method === "Target.getTargets") return { targetInfos: [] };
+        return {};
+      },
+    } as unknown as CdpConnection;
+    const result = await inspectRaceConnection(connection, mainUrl);
+    if (stage === "stable")
+      expect(result.scripts.items).toContainEqual(
+        expect.objectContaining({ frame_id: "child", cdp_hash: "stable" }),
+      );
+    else {
+      expect(fired).toBe(true);
+      if (stage !== "final")
+        expect(result.scripts.items).toContainEqual(
+          expect.objectContaining({ frame_id: null, cdp_hash: "new-document" }),
+        );
+      expect(result.completeness.attach_limited_sections).toContain("frames");
+    }
+  },
+);
 
 afterEach(async () => {
   await Promise.all(
@@ -24,6 +220,193 @@ afterEach(async () => {
       .map((path) => rm(path, { recursive: true, force: true })),
   );
 });
+
+it.each([
+  "late-main",
+  "late-main-progress",
+  "duplicate-initial",
+  "duplicate-main",
+  "duplicate-child",
+  "replacement-child",
+  "unknown-child",
+])(
+  "preserves document identity through final file validation: %s",
+  async (kind) => {
+    const root = await mkdtemp(
+      join(tmpdir(), "rea-electron-document-identity-"),
+    );
+    temporary.push(root);
+    const main = join(root, "main.html"),
+      child = join(root, "child.html"),
+      script = join(root, "app.js");
+    await Promise.all([
+      writeFile(main, "main"),
+      writeFile(child, "child"),
+      writeFile(script, "void 0;"),
+    ]);
+    const mainUrl = pathToFileURL(main).href,
+      childUrl = pathToFileURL(child).href;
+    let listener: (event: CdpEvent) => void = () => {};
+    let reads = 0,
+      fired = false;
+    const inject = () => {
+      const isMain =
+        kind.startsWith("late-main") ||
+        kind === "duplicate-main" ||
+        kind === "duplicate-initial";
+      listener({
+        method: "Page.frameNavigated",
+        params: {
+          frame: {
+            id: isMain ? "main" : "child",
+            ...(isMain ? {} : { parentId: "main" }),
+            url: isMain ? mainUrl : childUrl,
+            ...(kind === "unknown-child"
+              ? {}
+              : {
+                  loaderId:
+                    kind.startsWith("late-main") || kind === "replacement-child"
+                      ? "replacement-loader"
+                      : isMain
+                        ? "loader-main"
+                        : "loader-child",
+                }),
+          },
+        },
+      });
+      if (!isMain) {
+        listener({
+          method: "Runtime.executionContextCreated",
+          params: { context: { id: 7, auxData: { frameId: "child" } } },
+        });
+        listener({
+          method: "Debugger.scriptParsed",
+          params: {
+            scriptId: "observed",
+            url: pathToFileURL(script).href,
+            executionContextId: 7,
+            hash: "observed",
+          },
+        });
+      }
+    };
+    const connection = {
+      onEvent: (value: typeof listener) => {
+        listener = value;
+        return () => {};
+      },
+      send: async (method: string) => {
+        if (method === "Page.getFrameTree") {
+          reads++;
+          const trigger =
+            kind === "late-main-progress"
+              ? false
+              : kind === "duplicate-initial"
+                ? reads === 1
+                : kind === "late-main"
+                  ? reads === 3
+                  : reads === 2;
+          let frameUrlReads = 0;
+          return {
+            frameTree: {
+              frame: { id: "main", url: mainUrl, loaderId: "loader-main" },
+              childFrames: [
+                {
+                  frame: {
+                    id: "child",
+                    parentId: "main",
+                    loaderId: "loader-child",
+                    get url() {
+                      frameUrlReads++;
+                      // Seeded protocol facts are read first; inject during the later file check.
+                      if (
+                        trigger &&
+                        !fired &&
+                        (kind !== "late-main" || frameUrlReads === 2)
+                      ) {
+                        fired = true;
+                        queueMicrotask(inject);
+                      }
+                      return childUrl;
+                    },
+                  },
+                },
+              ],
+            },
+          };
+        }
+        if (method === "Page.getResourceTree")
+          return {
+            frameTree: { frame: { id: "main", url: mainUrl }, resources: [] },
+          };
+        if (method === "DOMSnapshot.captureSnapshot")
+          return { strings: [], documents: [] };
+        if (method === "Target.getTargets") return { targetInfos: [] };
+        return {};
+      },
+    } as unknown as CdpConnection;
+    const result = inspectRaceConnection(connection, mainUrl, {
+      report: async (update) => {
+        if (kind === "late-main-progress" && update.completed === 3) {
+          fired = true;
+          inject();
+        }
+      },
+    });
+    if (kind.startsWith("late-main"))
+      await expect(result).rejects.toMatchObject({ reason: "target_changed" });
+    else {
+      const captured = await result;
+      expect(fired).toBe(true);
+      if (kind.startsWith("duplicate"))
+        expect(captured.completeness.attach_limited_sections).not.toContain(
+          "frames",
+        );
+      if (kind !== "duplicate-main" && kind !== "duplicate-initial")
+        expect(captured.scripts.items).toContainEqual(
+          expect.objectContaining({
+            cdp_hash: "observed",
+            frame_id: kind === "duplicate-child" ? "child" : null,
+          }),
+        );
+    }
+  },
+);
+
+it.each([7, null, "", "claimed-parent"])(
+  "does not promote children when the enclosing root has a parent: %s",
+  async (parentId) => {
+    const root = await mkdtemp(join(tmpdir(), "rea-electron-root-role-"));
+    temporary.push(root);
+    const main = join(root, "index.html");
+    await writeFile(main, "main");
+    const completeness = new CdpCaptureCompleteness();
+    const { frames } = await captureFrames(
+      {
+        frameTree: {
+          frame: { id: "main", url: pathToFileURL(main).href, parentId },
+          childFrames: [
+            {
+              frame: {
+                id: "child",
+                parentId: "main",
+                url: pathToFileURL(main).href,
+              },
+            },
+          ],
+        },
+      },
+      completeness,
+    );
+    expect(frames).toEqual([]);
+    expect(completeness.snapshot().excluded).toContainEqual({
+      section: "frames",
+      reason: "invalid_protocol_value",
+      count: 2,
+    });
+    expect(completeness.snapshot().policy_filtered_sections).toEqual([]);
+  },
+);
 
 describe("Electron frame capture", () => {
   it.each([7, undefined])(
@@ -38,7 +421,7 @@ describe("Electron frame capture", () => {
       const childUrl = pathToFileURL(child).href;
       const completeness = new CdpCaptureCompleteness();
 
-      const frames = await captureFrames(
+      const { frames } = await captureFrames(
         {
           frameTree: {
             frame: { id: "frame-main", url: mainUrl },
@@ -130,7 +513,11 @@ describe("Electron frame capture", () => {
         include_script_sources: false,
       }),
       scripts,
-      frameIds: new Set(["frame-old", "frame-new"]),
+      frameForScript: (script) =>
+        script.frameId !== null &&
+        new Set(["frame-old", "frame-new"]).has(script.frameId)
+          ? script.frameId
+          : null,
       completeness,
     });
 
@@ -209,7 +596,7 @@ it("admits a prefix and fitting suffix around an oversized Electron source", asy
       include_script_sources: true,
     }),
     scripts,
-    frameIds: new Set(),
+    frameForScript: () => null,
     completeness,
   });
   const byHash = new Map(

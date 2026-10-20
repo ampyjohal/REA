@@ -30,6 +30,320 @@ afterEach(async () => {
   );
 });
 
+it.each(["late", "initial", "destroyed", "final-malformed", "out-of-scope"])(
+  "captures the current authorized frame inventory: %s",
+  async (kind) => {
+    const root = await electronFixture();
+    const mainUrl = pathToFileURL(join(root, "index.html")).href;
+    const childUrl = pathToFileURL(join(root, "child.html")).href;
+    const scriptUrl = pathToFileURL(join(root, "app.js")).href;
+    const browser = await startFakeCdpBrowser({
+      electronFileUrl: mainUrl,
+      eventsBeforeReply: ["Runtime.enable", "Debugger.enable"],
+      commandResult: ({ method }, _origin, reads) =>
+        method === "Page.getFrameTree"
+          ? {
+              frameTree: {
+                frame: { id: "frame-main", url: mainUrl },
+                childFrames:
+                  reads > 1 || kind === "initial"
+                    ? [
+                        {
+                          frame: {
+                            id: "child",
+                            parentId: "frame-main",
+                            url:
+                              kind === "out-of-scope"
+                                ? "https://foreign.test/child"
+                                : childUrl,
+                          },
+                        },
+                      ]
+                    : [],
+                ...(kind === "final-malformed" && reads > 2
+                  ? {
+                      childFrames: [
+                        {
+                          frame: {
+                            id: "child",
+                            parentId: "frame-main",
+                            url: childUrl,
+                          },
+                        },
+                        null,
+                      ],
+                    }
+                  : {}),
+              },
+            }
+          : method === "Debugger.getScriptSource"
+            ? { scriptSource: "void 0;" }
+            : undefined,
+      commandEvents: ({ method, sessionId }) =>
+        method === "Runtime.enable"
+          ? [
+              {
+                method: "Runtime.executionContextCreated",
+                ...(sessionId === undefined ? {} : { sessionId }),
+                params: { context: { id: 7, auxData: { frameId: "child" } } },
+              },
+            ]
+          : method === "Debugger.enable"
+            ? [
+                {
+                  method: "Debugger.scriptParsed",
+                  ...(sessionId === undefined ? {} : { sessionId }),
+                  params: {
+                    scriptId: "child-script",
+                    url: scriptUrl,
+                    executionContextId: 7,
+                    length: 7,
+                    scriptLanguage: "JavaScript",
+                  },
+                },
+                ...(kind === "destroyed"
+                  ? [
+                      {
+                        method: "Runtime.executionContextDestroyed",
+                        ...(sessionId === undefined ? {} : { sessionId }),
+                        params: { executionContextId: 7 },
+                      },
+                    ]
+                  : []),
+              ]
+            : undefined,
+    });
+    browsers.push(browser);
+    const inspected = await new CdpElectronProvider().inspectPage(
+      inspectElectronPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        target_id: "electron-page",
+        observation_ms: 0,
+        include_script_sources: true,
+      }),
+    );
+    if (!inspected.ok) throw inspected.error;
+    expect(
+      inspected.value.frames.some(({ frame_id }) => frame_id === "child"),
+    ).toBe(kind !== "out-of-scope");
+    expect(inspected.value.scripts.items).toContainEqual(
+      expect.objectContaining({
+        file_path: join(root, "app.js"),
+        // Main snapshots historical frame identity at script ingestion, so
+        // later context teardown does not erase this observed association.
+        frame_id: kind === "out-of-scope" ? null : "child",
+      }),
+    );
+    if (kind === "final-malformed") {
+      expect(inspected.value.completeness.attach_limited_sections).toEqual(
+        expect.arrayContaining(["frames", "scripts", "workers"]),
+      );
+      expect(
+        inspected.value.completeness.excluded.filter(
+          ({ section }) => section === "frames",
+        ),
+      ).toEqual([]);
+    }
+  },
+);
+it.each(["reordered", "parent-changed", "path-changed"])(
+  "compares semantic frame inventory independent of sibling order: %s",
+  async (kind) => {
+    const root = await electronFixture();
+    const main = pathToFileURL(join(root, "index.html")).href;
+    const child = pathToFileURL(join(root, "child.html")).href;
+    const app = pathToFileURL(join(root, "app.js")).href;
+    const browser = await startFakeCdpBrowser({
+      electronFileUrl: main,
+      commandResult: ({ method }, _origin, reads) => {
+        if (method !== "Page.getFrameTree") return undefined;
+        const first = {
+          frame: {
+            id: "first",
+            parentId:
+              reads > 2 && kind === "parent-changed" ? "second" : "frame-main",
+            url: reads > 2 && kind === "path-changed" ? app : child,
+          },
+        };
+        const second = {
+          frame: { id: "second", parentId: "frame-main", url: app },
+        };
+        return {
+          frameTree: {
+            frame: { id: "frame-main", url: main },
+            childFrames: reads > 2 ? [second, first] : [first, second],
+          },
+        };
+      },
+    });
+    browsers.push(browser);
+    const result = await new CdpElectronProvider().inspectPage(
+      inspectElectronPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        target_id: "electron-page",
+        observation_ms: 0,
+      }),
+    );
+    if (!result.ok) throw result.error;
+    expect(result.value.frames.map(({ frame_id }) => frame_id)).toEqual([
+      "frame-main",
+      "first",
+      "second",
+    ]);
+    for (const section of ["frames", "scripts", "workers"] as const)
+      expect(
+        result.value.completeness.attach_limited_sections.includes(section),
+      ).toBe(kind !== "reordered");
+  },
+);
+
+it.each([
+  "detached",
+  "foreign-reuse",
+  "reparented",
+  "unvalidated-context",
+  "same-document",
+])("retains authorized historical script owners after %s", async (kind) => {
+  const root = await electronFixture();
+  const main = pathToFileURL(join(root, "index.html")).href;
+  const child = pathToFileURL(join(root, "child.html")).href;
+  const script = pathToFileURL(join(root, "app.js")).href;
+  const browser = await startFakeCdpBrowser({
+    electronFileUrl: main,
+    eventsBeforeReply: ["Debugger.enable"],
+    commandResult: ({ method }, _origin, reads) =>
+      method === "Page.getFrameTree"
+        ? {
+            frameTree: {
+              frame: { id: "frame-main", url: main },
+              childFrames:
+                reads === 1 || kind === "same-document"
+                  ? ["first", "second"].map((id) => ({
+                      frame: { id, parentId: "frame-main", url: child },
+                    }))
+                  : [],
+            },
+          }
+        : undefined,
+    commandEvents: ({ method, sessionId }) => {
+      if (method !== "Debugger.enable")
+        return method === "Runtime.enable" ? [] : undefined;
+      const scope = sessionId === undefined ? {} : { sessionId };
+      const sameDocument = (id: string, fragment: string) =>
+        kind === "same-document"
+          ? [
+              {
+                method: "Page.navigatedWithinDocument",
+                ...scope,
+                params: { frameId: id, url: `${child}#${fragment}` },
+              },
+            ]
+          : [];
+      const events = ["first", "second"].flatMap((id, index) => [
+        {
+          method: "Runtime.executionContextCreated",
+          ...scope,
+          params: { context: { id: index + 7, auxData: { frameId: id } } },
+        },
+        ...sameDocument(id, "before"),
+        {
+          method: "Debugger.scriptParsed",
+          ...scope,
+          params: {
+            scriptId: id,
+            url: script,
+            executionContextId: index + 7,
+            hash: "same",
+            length: 7,
+            scriptLanguage: "JavaScript",
+          },
+        },
+        ...sameDocument(id, "after"),
+        ...(kind === "detached"
+          ? [
+              {
+                method: "Page.frameDetached",
+                ...scope,
+                params: { frameId: id, reason: "remove" },
+              },
+            ]
+          : []),
+      ]);
+      return kind !== "detached" && kind !== "same-document"
+        ? [
+            ...events,
+            {
+              method:
+                kind === "reparented"
+                  ? "Page.frameAttached"
+                  : "Page.frameNavigated",
+              ...scope,
+              params:
+                kind === "reparented"
+                  ? { frameId: "first", parentFrameId: "unknown-parent" }
+                  : {
+                      frame: {
+                        id: "first",
+                        parentId: "frame-main",
+                        url: "https://foreign.test/",
+                      },
+                    },
+            },
+            ...(kind === "unvalidated-context"
+              ? [
+                  {
+                    method: "Runtime.executionContextCreated",
+                    ...scope,
+                    params: {
+                      context: {
+                        id: 7,
+                        auxData: { frameId: "not-authorized" },
+                      },
+                    },
+                  },
+                ]
+              : []),
+            {
+              method: "Debugger.scriptParsed",
+              ...scope,
+              params: {
+                scriptId: "foreign-reused",
+                url: script,
+                executionContextId: 7,
+                hash: "foreign",
+              },
+            },
+          ]
+        : events;
+    },
+  });
+  browsers.push(browser);
+  const result = await new CdpElectronProvider().inspectPage(
+    inspectElectronPageInputSchema.parse({
+      cdp_endpoint: browser.endpoint,
+      target_id: "electron-page",
+      observation_ms: 0,
+    }),
+  );
+  if (!result.ok) throw result.error;
+  expect(result.value.frames.map(({ frame_id }) => frame_id)).toEqual(
+    kind === "same-document"
+      ? ["frame-main", "first", "second"]
+      : ["frame-main"],
+  );
+  expect(
+    result.value.scripts.items
+      .filter(({ cdp_hash }) => cdp_hash === "same")
+      .map(({ frame_id }) => frame_id)
+      .sort(),
+  ).toEqual(["first", "second"]);
+  if (kind !== "detached" && kind !== "same-document")
+    expect(
+      result.value.scripts.items.find(({ cdp_hash }) => cdp_hash === "foreign")
+        ?.frame_id,
+    ).toBeNull();
+});
+
 describe("CdpElectronProvider target access", () => {
   it("retains a completed page observation when cancellation arrives during final detach", async () => {
     const root = await electronFixture();
@@ -576,3 +890,298 @@ const electronFixture = async (): Promise<string> => {
   await writeFile(join(root, "child.html"), "<div>child</div>");
   return root;
 };
+
+it.each(
+  ["initial", "refreshed"].flatMap((phase) =>
+    ["missing", "number", "null", "empty", "foreign", "cycle", "valid"].map(
+      (parent) => ({ phase, parent }),
+    ),
+  ),
+)(
+  "does not authorize unproved nested Electron ancestry: $phase/$parent",
+  async ({ phase, parent }) => {
+    const root = await electronFixture();
+    const main = pathToFileURL(join(root, "index.html")).href;
+    const child = pathToFileURL(join(root, "child.html")).href;
+    const script = pathToFileURL(join(root, "app.js")).href;
+    const parentValue =
+      parent === "number"
+        ? 7
+        : parent === "null"
+          ? null
+          : parent === "empty"
+            ? ""
+            : parent === "foreign"
+              ? "other"
+              : parent === "cycle"
+                ? "child"
+                : "frame-main";
+    let eventFrameReads = 0;
+    const browser = await startFakeCdpBrowser({
+      electronFileUrl: main,
+      eventsBeforeReply: ["Debugger.enable", "Page.getFrameTree"],
+      commandResult: ({ method }, _origin, reads) =>
+        method === "Page.getFrameTree"
+          ? {
+              frameTree: {
+                frame: { id: "frame-main", url: main },
+                childFrames:
+                  phase === "refreshed" && reads === 1
+                    ? []
+                    : [
+                        {
+                          frame: {
+                            id: "child",
+                            url: child,
+                            ...(parent === "missing"
+                              ? {}
+                              : { parentId: parentValue }),
+                          },
+                          childFrames: [
+                            {
+                              frame: {
+                                id: "grandchild",
+                                parentId: "child",
+                                url: child,
+                              },
+                            },
+                          ],
+                        },
+                      ],
+              },
+            }
+          : undefined,
+      commandEvents: ({ method, sessionId }) => {
+        if (method === "Page.getFrameTree") eventFrameReads++;
+        if (
+          !(phase === "initial"
+            ? method === "Debugger.enable"
+            : method === "Page.getFrameTree" && eventFrameReads === 2)
+        )
+          return method === "Runtime.enable" || method === "Debugger.enable"
+            ? []
+            : undefined;
+        const scope = sessionId === undefined ? {} : { sessionId };
+        return ["child", "grandchild"].flatMap((id, index) => [
+          {
+            method: "Runtime.executionContextCreated",
+            ...scope,
+            params: { context: { id: 70 + index, auxData: { frameId: id } } },
+          },
+          {
+            method: "Debugger.scriptParsed",
+            ...scope,
+            params: {
+              scriptId: id,
+              url: script,
+              executionContextId: 70 + index,
+              hash: id,
+              length: 7,
+              scriptLanguage: "JavaScript",
+            },
+          },
+        ]);
+      },
+    });
+    browsers.push(browser);
+    const result = await new CdpElectronProvider().inspectPage(
+      inspectElectronPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        target_id: "electron-page",
+        observation_ms: 0,
+      }),
+    );
+    if (!result.ok) throw result.error;
+    expect(result.value.frames.map((f) => f.frame_id)).toEqual(
+      parent === "valid"
+        ? ["frame-main", "child", "grandchild"]
+        : ["frame-main"],
+    );
+    for (const id of ["child", "grandchild"])
+      expect(result.value.scripts.items).toContainEqual(
+        expect.objectContaining({
+          cdp_hash: id,
+          frame_id: parent === "valid" ? id : null,
+        }),
+      );
+    if (parent !== "valid") {
+      expect(result.value.completeness.unavailable_sections).toContain(
+        "frames",
+      );
+      expect(result.value.completeness.attach_limited_sections).toContain(
+        "scripts",
+      );
+      expect(result.value.completeness.policy_filtered_sections).not.toContain(
+        "frames",
+      );
+    }
+  },
+);
+
+it.each(
+  ["blank", "remote", "missing-file"].flatMap((parent) =>
+    ["initial", "refreshed", "invalidated"].map((phase) => ({ parent, phase })),
+  ),
+)(
+  "separates structural ancestry from parent file policy: $parent/$phase",
+  async ({ parent, phase }) => {
+    const root = await electronFixture();
+    const main = pathToFileURL(join(root, "index.html")).href;
+    const child = pathToFileURL(join(root, "child.html")).href;
+    const script = pathToFileURL(join(root, "app.js")).href;
+    const parentUrl =
+      parent === "blank"
+        ? "about:blank"
+        : parent === "remote"
+          ? "https://foreign.invalid/frame"
+          : pathToFileURL(join(root, "absent.html")).href;
+    let eventReads = 0;
+    const browser = await startFakeCdpBrowser({
+      electronFileUrl: main,
+      eventsBeforeReply: ["Page.getFrameTree", "Debugger.enable"],
+      commandResult: ({ method }, _origin, reads) =>
+        method === "Page.getFrameTree"
+          ? {
+              frameTree: {
+                frame: { id: "frame-main", url: main },
+                childFrames:
+                  phase === "refreshed" && reads === 1
+                    ? []
+                    : [
+                        {
+                          frame: {
+                            id: "parent",
+                            parentId: "frame-main",
+                            url: parentUrl,
+                          },
+                          childFrames: [
+                            {
+                              frame: {
+                                id: "local",
+                                parentId: "parent",
+                                url: child,
+                              },
+                            },
+                          ],
+                        },
+                      ],
+              },
+            }
+          : undefined,
+      commandEvents: ({ method, sessionId }) => {
+        if (method === "Page.getFrameTree") eventReads++;
+        if (
+          !(phase === "refreshed" || phase === "invalidated"
+            ? method === "Page.getFrameTree" && eventReads === 2
+            : method === "Debugger.enable")
+        )
+          return method === "Runtime.enable" || method === "Debugger.enable"
+            ? []
+            : undefined;
+        const scope = sessionId === undefined ? {} : { sessionId };
+        return [
+          ...(phase === "invalidated"
+            ? [
+                {
+                  method: "Page.frameNavigated",
+                  ...scope,
+                  params: {
+                    frame: {
+                      id: "parent",
+                      parentId: "frame-main",
+                      url: parentUrl,
+                      loaderId: "new-parent",
+                    },
+                  },
+                },
+              ]
+            : []),
+          {
+            method: "Runtime.executionContextCreated",
+            ...scope,
+            params: { context: { id: 81, auxData: { frameId: "local" } } },
+          },
+          {
+            method: "Debugger.scriptParsed",
+            ...scope,
+            params: {
+              scriptId: "local",
+              url: script,
+              executionContextId: 81,
+              hash: "local",
+              length: 7,
+              scriptLanguage: "JavaScript",
+            },
+          },
+        ];
+      },
+    });
+    browsers.push(browser);
+    const result = await new CdpElectronProvider().inspectPage(
+      inspectElectronPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        target_id: "electron-page",
+        observation_ms: 0,
+      }),
+    );
+    if (!result.ok) throw result.error;
+    expect(result.value.frames.map((frame) => frame.frame_id)).toEqual([
+      "frame-main",
+      "local",
+    ]);
+    expect(result.value.scripts.items).toContainEqual(
+      expect.objectContaining({
+        cdp_hash: "local",
+        frame_id: phase === "invalidated" ? null : "local",
+      }),
+    );
+    expect(result.value.completeness.policy_filtered_sections).toContain(
+      "frames",
+    );
+    expect(result.value.completeness.excluded).not.toContainEqual(
+      expect.objectContaining({
+        section: "frames",
+        reason: "invalid_protocol_value",
+      }),
+    );
+  },
+);
+
+it.each(["about:blank", "https://foreign.invalid/root"])(
+  "does not replace an unauthorized tree root with a local descendant: %s",
+  async (rootUrl) => {
+    const root = await electronFixture();
+    const local = pathToFileURL(join(root, "index.html")).href;
+    const browser = await startFakeCdpBrowser({
+      electronFileUrl: local,
+      commandResult: ({ method }) =>
+        method === "Page.getFrameTree"
+          ? {
+              frameTree: {
+                frame: { id: "frame-main", url: rootUrl },
+                childFrames: [
+                  {
+                    frame: { id: "local", parentId: "frame-main", url: local },
+                  },
+                ],
+              },
+            }
+          : undefined,
+    });
+    browsers.push(browser);
+    const result = await new CdpElectronProvider().inspectPage(
+      inspectElectronPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        target_id: "electron-page",
+        observation_ms: 0,
+      }),
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: { reason: "target_not_allowed" },
+    });
+    expect(browser.commands.map(({ method }) => method)).not.toContain(
+      "Debugger.enable",
+    );
+  },
+);

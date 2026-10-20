@@ -97,6 +97,36 @@ const entry = (
   return found;
 };
 
+it("advertises offline capture inspection independently of browser availability", () => {
+  for (const policy of [
+    { processCaptureEnabled: false },
+    {
+      processCaptureEnabled: false,
+      optionalProviderLoadFailures: {
+        browserObservation: {
+          providerId: "rea-cdp-browser",
+          reason: "synthetic import failure",
+        },
+      },
+    },
+  ]) {
+    expect(
+      buildCapabilityInventory(status(), policy).find(
+        ({ name }) => name === "inspect_web_network_capture",
+      ),
+    ).toMatchObject({
+      available: true,
+      reason: "available",
+      remediation: null,
+    });
+    expect(
+      buildCapabilityInventory(status(), policy).find(
+        ({ name }) => name === "list_browser_targets",
+      ),
+    ).toMatchObject({ available: false });
+  }
+});
+
 describe("ADB and Apktool host availability", () => {
   it("uses only their selected owner probes", () => {
     const ready = {

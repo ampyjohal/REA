@@ -203,6 +203,53 @@ afterEach(async () => {
 });
 
 describe("web capture diff", () => {
+  it("keeps recorded WebMCP drops unknown independently of section markers", async () => {
+    const browser = await startFakeCdpBrowser({ webMcpTools: true });
+    browsers.push(browser);
+    const provider = new CdpBrowserProvider();
+    const input = {
+      cdp_endpoint: browser.endpoint,
+      allowed_origins: [browser.allowedOrigin],
+      target_id: "allowed-page",
+      observation_ms: 0,
+    };
+    const inspected = await provider.inspectPage(
+      inspectWebPageInputSchema.parse(input),
+    );
+    const discovered = await provider.discoverWebMcpTools(
+      discoverWebMcpToolsInputSchema.parse(input),
+    );
+    if (!inspected.ok) throw inspected.error;
+    if (!discovered.ok) throw discovered.error;
+    const complete = structuredClone(discovered.value);
+    markSectionsComplete(complete, ["webmcp_tools"]);
+    complete.tools = { ...complete.tools, total: 0, items: [] };
+    const dropped = structuredClone(complete);
+    dropped.completeness.dropped_events.webmcp_tools = 1;
+    dropped.completeness.dropped_events.total = 1;
+    dropped.completeness.status = "truncated";
+    dropped.completeness.conditions = ["truncated"];
+    const unrelated = structuredClone(complete);
+    unrelated.completeness.dropped_events.network_requests = 1;
+    unrelated.completeness.dropped_events.total = 1;
+    for (const [before, after, status] of [
+      [complete, dropped, "unknown"],
+      [dropped, complete, "unknown"],
+      [complete, complete, "unchanged"],
+      [complete, unrelated, "unchanged"],
+    ] as const) {
+      const compared = compareWebCaptures(
+        compareWebCapturesInputSchema.parse({
+          before: { inspection: inspected.value, webmcp: before },
+          after: { inspection: inspected.value, webmcp: after },
+        }),
+      );
+      expect(compared.dimensions.webmcp).toMatchObject({
+        status,
+        total_changes: 0,
+      });
+    }
+  });
   it.each([
     { missing: "before", changed: false, expected: "unknown" },
     { missing: "after", changed: false, expected: "unknown" },

@@ -9,6 +9,94 @@ import { ok } from "../../../src/domain/result.js";
 import { webNetworkCaptureSchema } from "../../../src/domain/webNetworkCapture.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { expandToolAvailability } from "../../../src/contracts/toolOutputSchemaPrimitives.js";
+import { connectLocalToolsMcp } from "../../fixtures/localToolsMcp.js";
+
+it.each([false, true])(
+  "advertises offline HAR without a browser (load failure: %s)",
+  async (failed) => {
+    const session = createTestBinarySession(() => {
+      throw new Error("No binary provider");
+    });
+    const server = createServer(
+      { kind: "session", session },
+      failed
+        ? {
+            optionalProviderLoadFailures: {
+              browserObservation: {
+                providerId: "rea-cdp-browser",
+                reason: "synthetic import failure",
+              },
+            },
+          }
+        : {},
+    );
+    const client = new Client({
+      name: "offline-har-availability",
+      version: "1",
+    });
+    onTestFinished(async () => {
+      await client.close();
+      await server.close();
+      await session.close();
+    });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const status = await client.callTool({
+      name: "binary_session",
+      arguments: {},
+    });
+    const parsed = toolContract("binary_session").outputSchema.parse(
+      status.structuredContent,
+    );
+    const availability = expandToolAvailability(
+      parsed.result.tool_availability,
+    );
+    expect(
+      availability.find(({ name }) => name === "inspect_web_network_capture"),
+    ).toMatchObject({
+      available: true,
+      reason: "available",
+      remediation: null,
+    });
+    expect(
+      availability.find(({ name }) => name === "list_browser_targets"),
+    ).toMatchObject({
+      available: false,
+      reason: failed ? "provider_unavailable" : "provider_missing",
+    });
+  },
+);
+
+it("decodes a retained HAR through the compiled stdio MCP service", async () => {
+  const root = await createTestTempDirectory("rea-har-availability-");
+  const capture_path = join(root, "empty.har");
+  await writeFile(
+    capture_path,
+    JSON.stringify({
+      log: {
+        version: "1.2",
+        creator: { name: "fixture", version: "1" },
+        entries: [],
+      },
+    }),
+  );
+  const { client } = await connectLocalToolsMcp();
+  const response = await client.callTool({
+    name: "inspect_web_network_capture",
+    arguments: { capture_path, format: "har" },
+  });
+  expect(response).toMatchObject({
+    structuredContent: {
+      normalized_result: { format: "har", total_records: 0, records: [] },
+    },
+  });
+});
 
 it("publishes valid SDK schemas and retains historical inline Evidence with the supplied session", async () => {
   const service = new WebNetworkCaptureService({

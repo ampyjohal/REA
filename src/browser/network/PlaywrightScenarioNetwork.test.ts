@@ -171,6 +171,30 @@ const bodyText = (event: BrowserScenarioEvent) => {
 
 afterEach(() => vi.useRealTimers());
 
+it.each(["finished", "failed", "unfinished"])(
+  "counts selected omitted response content when %s",
+  async (terminal) => {
+    const { collector, omittedEventCounts } = harness(
+      { request_body: false, response_body: true, header_values: false },
+      undefined,
+      "fixture",
+      { max_network_transactions: 1 },
+    );
+    collector.request(new RequestFixture("admitted"));
+    const request = new RequestFixture("omitted");
+    const response = new ResponseFixture(request, "response");
+    collector.request(request);
+    collector.response(response);
+    collector.response(response);
+    if (terminal === "finished") collector.finished(request);
+    if (terminal === "failed") collector.failed(request);
+    await collector.finish();
+    expect(omittedEventCounts.get("network-content")).toBe(1);
+    expect(response.bodyReads).toBe(0);
+    expect(request.bodyReads).toBe(0);
+  },
+);
+
 it("redacts declared secrets in browser-produced form and JSON encodings", async () => {
   for (const secret of ["私密", 'space " and \n']) {
     const { collector, events } = harness(selection, undefined, secret);

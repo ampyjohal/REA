@@ -729,6 +729,7 @@ const webMcpDimension = (
 const webMcpComplete = (discovery: WebMcpDiscovery | null): boolean =>
   discovery !== null &&
   discovery.status === "available" &&
+  discovery.completeness.dropped_events.webmcp_tools === 0 &&
   !incompleteSections(discovery.completeness).has("webmcp_tools");
 
 const sectionsComplete = (

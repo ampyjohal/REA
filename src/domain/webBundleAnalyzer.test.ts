@@ -14,6 +14,40 @@ import { createWebTextArtifact } from "./webContentArtifact.js";
 
 const origin = "https://app.example.test";
 
+it.each([
+  ["[``]", "catalog"],
+  ['[""]', "catalog"],
+  ['""', "catalog"],
+  ["[unknownKey]", null],
+  ["...unknownProperties", null],
+  ["name", null],
+])("preserves exact WebMCP keys independently of syntax: %s", (key, name) => {
+  const property = key.startsWith("...") ? key : `${key}: 0`;
+  const result = analyzeCapturedWebBundle(
+    inspection(
+      `document.modelContext.registerTool({name: "catalog", ${property}});`,
+    ),
+  );
+  expect(result.observations.webmcp_declarations).toEqual([
+    expect.objectContaining({ name, trust: "page-declared-untrusted" }),
+  ]);
+});
+
+it("retains an exact empty WebMCP input key without inventing a dynamic key", () => {
+  const result = analyzeCapturedWebBundle(
+    inspection(
+      'document.modelContext.registerTool({name:"catalog",inputSchema:{type:"object",properties:{"":{},[``]:{},ordinary:{},[unknownKey]:{}}}});',
+    ),
+  );
+  expect(result.observations.webmcp_declarations).toEqual([
+    expect.objectContaining({
+      name: "catalog",
+      schema_property_names: ["", "ordinary"],
+      trust: "page-declared-untrusted",
+    }),
+  ]);
+});
+
 it("retains standalone GraphQL Source operations in captured scripts", () => {
   const result = analyzeCapturedWebBundle(
     inspection(`

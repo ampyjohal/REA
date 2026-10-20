@@ -3,34 +3,14 @@ import * as t from "@babel/types";
 import { sanitizeBrowserUrl } from "./browserObservation.js";
 import {
   readExactJavaScriptLiteral,
-  semanticStaticPropertyName,
+  semanticFinalObjectProperty,
 } from "./javascript/javascriptAstValues.js";
-
-/** Pick the endpoint argument for common network-call patterns. */
-
-export const objectValue = (
-  object: t.ObjectExpression,
-  name: string,
-): t.ObjectProperty["value"] | undefined => {
-  let value: t.ObjectProperty["value"] | undefined;
-  for (const property of object.properties) {
-    if (t.isSpreadElement(property)) {
-      value = undefined;
-      continue;
-    }
-    const key = semanticStaticPropertyName(property.key, property.computed);
-    if (key === "" && !t.isStringLiteral(property.key)) value = undefined;
-    else if (key === name)
-      value = t.isObjectProperty(property) ? property.value : undefined;
-  }
-  return value;
-};
 
 export const objectString = (
   object: t.ObjectExpression,
   name: string,
 ): string | undefined => {
-  const value = objectValue(object, name);
+  const value = semanticFinalObjectProperty(object, name);
   if (value === undefined) return undefined;
   const literal = readExactJavaScriptLiteral(value);
   return literal.found && typeof literal.value === "string"
