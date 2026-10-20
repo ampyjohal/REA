@@ -45,7 +45,12 @@ export const normalizeArtifactPath = (input: string): string => {
 export class ArtifactPathRegistry {
   readonly #root: PathTrieNode = { kind: undefined, children: new Map() };
 
-  add(path: string, kind: "file" | "directory" | "symlink" | "slice"): void {
+  add(
+    path: string,
+    kind: "file" | "directory" | "symlink" | "slice" | "metadata",
+  ): void {
+    // Declarations have logical identities but claim no materializable path.
+    if (kind === "metadata") return;
     const parts = path.split("/");
     let node = this.#root;
     for (const [index, part] of parts.entries()) {

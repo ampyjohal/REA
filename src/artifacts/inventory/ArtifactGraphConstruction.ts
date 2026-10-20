@@ -82,16 +82,18 @@ export const createOccurrence = (
   duplicateOrdinal = 0,
 ): MutableOccurrence => {
   const role =
-    entry.kind === "directory"
-      ? {
-          kind: path.toLowerCase().endsWith(".framework")
-            ? ("framework" as const)
-            : ("container" as const),
-          format: "directory" as const,
-        }
-      : containerSuffixFamily(path) === undefined
-        ? classifyArtifactPath(path)
-        : ({ kind: "unknown", format: "unknown" } as const);
+    entry.kind === "metadata"
+      ? { kind: "package-metadata" as const, format: "unknown" as const }
+      : entry.kind === "directory"
+        ? {
+            kind: path.toLowerCase().endsWith(".framework")
+              ? ("framework" as const)
+              : ("container" as const),
+            format: "directory" as const,
+          }
+        : containerSuffixFamily(path) === undefined
+          ? classifyArtifactPath(path)
+          : ({ kind: "unknown", format: "unknown" } as const);
   return {
     occurrence_id: `occ_${digestCanonicalValue(
       duplicateOrdinal === 0
@@ -263,7 +265,7 @@ export const rootOccurrenceFor = (
   artifact_kind:
     metadata.format === "directory" ||
     isZipPackageFormat(metadata.format) ||
-    ["asar", "godot-pck", "dmg", "pkg"].includes(metadata.format)
+    ["asar", "godot-pck", "dmg", "pkg", "pyinstaller"].includes(metadata.format)
       ? "container"
       : artifactRoleForFormat(metadata.path, metadata.format).kind,
   artifact_format: metadata.format,
@@ -364,11 +366,14 @@ export const createArtifactEdges = (
       relation:
         occurrence.entry_kind === "slice"
           ? ("slice-of" as const)
-          : isSourceMap
-            ? mappedSource === undefined
-              ? ("contains" as const)
-              : ("maps-source" as const)
-            : relationFor(occurrence.logical_path),
+          : occurrence.format_metadata?.kind === "pyinstaller-entry" &&
+              occurrence.format_metadata.bytecode_header === "derived"
+            ? ("derived-from" as const)
+            : isSourceMap
+              ? mappedSource === undefined
+                ? ("contains" as const)
+                : ("maps-source" as const)
+              : relationFor(occurrence.logical_path),
       occurrence_id: occurrence.occurrence_id,
     };
     edges.push({

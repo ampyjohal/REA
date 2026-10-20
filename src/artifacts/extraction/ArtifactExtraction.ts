@@ -23,6 +23,8 @@ import { SafeOutputTreeCreationFailure } from "../SafeOutputTreeCreationFailure.
 import { ZipArtifactReader } from "../ZipArtifactReader.js";
 import { isZipPackageFormat } from "../../domain/zipPackageFormat.js";
 import { MachOSliceArtifactReader } from "../MachOSliceArtifactReader.js";
+import { PyInstallerArtifactReader } from "../PyInstallerArtifactReader.js";
+import { containsPyInstallerArchive } from "../pyinstaller/CArchiveLayout.js";
 import {
   artifactExtractionResultSchema,
   type ArtifactExtractionResult,
@@ -244,6 +246,7 @@ const materializeSelection = async ({
     sourcePath,
     input,
     inventory.manifest.root_format,
+    signal,
   );
   const readerOwner: ArtifactResourceOwner = {
     kind: "reader" as const,
@@ -444,10 +447,17 @@ const requireExtractableFormat = async (
       path,
       input.resourceScope,
       signal,
-      async (handle) =>
-        locateGodotPck(handle, (await handle.stat()).size, signal),
+      async (handle) => {
+        const size = (await handle.stat()).size;
+        if (await locateGodotPck(handle, size, signal)) return true;
+        if (format !== "elf" && format !== "pe") return false;
+        abortIfNeeded(signal);
+        const packaged = await containsPyInstallerArchive(handle, size);
+        abortIfNeeded(signal);
+        return packaged;
+      },
     );
-    if (pack === undefined)
+    if (!pack)
       throw new AnalysisUnsupportedTargetError(
         "extract_artifact",
         input.inputPath,
@@ -464,10 +474,13 @@ const createReader = async (
     "inputPath" | "inputFormat" | "environment" | "resourceScope"
   >,
   containerFormat: ArtifactGraphManifest["root_format"],
+  signal?: AbortSignal,
 ): Promise<ArtifactReader> => {
   const format = input.inputFormat;
   if (containerFormat === "godot-pck") return new GodotPckArtifactReader(path);
-  if (await requireExtractableFormat(path, input))
+  if (containerFormat === "pyinstaller")
+    return new PyInstallerArtifactReader(path);
+  if (await requireExtractableFormat(path, input, signal))
     return new DirectoryArtifactReader(path);
   if (format === "asar") return new AsarArtifactReader(path);
   if (isZipPackageFormat(format)) return new ZipArtifactReader(path, format);
