@@ -458,6 +458,16 @@ redirected, which keeps large results smaller for agents and scripts; pipe
 through `jq .` for indented files. Output selection and formatting do not change
 operation status.
 
+Use `--format jsonl` for row-oriented results with a clear record boundary
+(such as analysis-view collections, inventories, or filtered arrays). Each
+emitted line is an independently parseable JSON record in deterministic order.
+When the result contains coverage or truncation metadata, a final metadata
+record (`{"$schema": "https://rea.dev/schemas/jsonl-coverage-v1.json", "type": "coverage", "coverage": ...}`)
+is emitted so that coverage is preserved without being mistaken for an ordinary
+data row. Errors in JSON Lines are emitted as an error record
+(`{"$schema": "https://rea.dev/schemas/jsonl-error-v1.json", "type": "error", "ok": false, "error": ...}`).
+Commands without a clear record boundary reject `--format jsonl`.
+
 `--filter-output` selects fields from successful command data. Classified failures
 retain their complete typed diagnostic projection even when the selector matches
 a field such as `code` or `message`, or names a missing field. `--full-output`

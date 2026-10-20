@@ -12,12 +12,16 @@ import {
   cliOperationFailureIdentity,
   cliOperationFailurePayload,
 } from "../cliLogging.js";
-import { AnalysisResourceConstraintError } from "../domain/analysisErrorCore.js";
+import {
+  AnalysisOutputError,
+  AnalysisResourceConstraintError,
+} from "../domain/analysisErrorCore.js";
 import {
   projectAnalysisError,
   type AnalysisErrorProjection,
 } from "../domain/analysisErrorProjection.js";
 import {
+  hasClearRecordBoundary,
   jsonOutputParts,
   writeJsonOutput,
   writeOutputText,
@@ -230,6 +234,22 @@ export const createCliResultOutput = (
       options.fullOutput || filterPaths !== undefined
         ? cliOperationFailurePayload(value)
         : undefined;
+    if (
+      format === "jsonl" &&
+      operationFailure === undefined &&
+      !hasClearRecordBoundary(value, filterPaths !== undefined)
+    ) {
+      error = projectAnalysisError(
+        new AnalysisOutputError(
+          metadata.command,
+          "JSON Lines output is available only for row-oriented results with a clear record boundary.",
+          {
+            remediationAction:
+              "Use --format json to stream the complete result, or select records with --filter-output.",
+          },
+        ),
+      );
+    }
     const failure = options.fullOutput ? operationFailure : undefined;
     const filtered: unknown =
       operationFailure ??
